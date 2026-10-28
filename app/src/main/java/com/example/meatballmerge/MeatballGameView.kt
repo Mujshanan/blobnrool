@@ -861,7 +861,12 @@ class MeatballGameView(context: Context) : View(context) {
         if (trail.points.size < 4 || !trail.captures) return
         // Captured blobs feed the black blob, increasing its radius with each capture.
         val captured = floodFilledSurvivors(trail.points)
-        if (captured.isNotEmpty()) hunterMass = (hunterMass + captured.size).coerceAtMost(9f)
+        if (captured.isNotEmpty()) {
+            hunterMass = (hunterMass + captured.size).coerceAtMost(9f)
+            val safeHunter = collideWithArena(hunterX, hunterY, hunterRadius)
+            hunterX = safeHunter.first
+            hunterY = safeHunter.second
+        }
         captured.forEach { survivor ->
             survivors.remove(survivor)
             if (selectedId == survivor.id) {
