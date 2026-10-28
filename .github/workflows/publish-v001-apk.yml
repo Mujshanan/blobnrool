@@ -1,0 +1,34 @@
+name: Publish APK to V0.0.1
+on:
+  push:
+    branches: [publish-v001-apk]
+permissions:
+  contents: write
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out merged source
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        run: gradle --no-daemon assembleDebug
+      - name: Verify APK exists and is non-empty
+        run: test -s app/build/outputs/apk/debug/app-debug.apk
+      - name: Upload APK to existing V0.0.1 release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: V0.0.1
+          files: app/build/outputs/apk/debug/app-debug.apk
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
