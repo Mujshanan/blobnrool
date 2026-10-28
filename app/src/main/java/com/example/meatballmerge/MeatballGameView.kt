@@ -17,6 +17,8 @@ import kotlin.random.Random
 private data class InkTrail(
     val points: MutableList<Pair<Float, Float>>,
     var closed: Boolean = false,
+    // A trail can close visually for fading without being a valid capture region.
+    var captures: Boolean = false,
     var age: Float = 0f
 )
 
@@ -279,11 +281,11 @@ class MeatballGameView(context: Context) : View(context) {
                     if (index == 0) path.moveTo(point.first, point.second)
                     else path.lineTo(point.first, point.second)
                 }
-                if (trail.closed) path.close()
+                if (trail.closed && trail.captures) path.close()
                 val alpha = if (trail.closed) (210f * (1f - trail.age / 9f).coerceIn(0f, 1f)).toInt() else 225
                 val fill = Paint(3).apply { color = Color.argb((alpha * .16f).toInt(), 15, 15, 18); style = Paint.Style.FILL }
                 val stroke = Paint(3).apply { color = Color.argb(alpha, 18, 18, 22); style = Paint.Style.STROKE; strokeWidth = dp(7f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
-                if (trail.closed) canvas.drawPath(path, fill)
+                if (trail.closed && trail.captures) canvas.drawPath(path, fill)
                 canvas.drawPath(path, stroke)
             }
         }
@@ -570,7 +572,10 @@ class MeatballGameView(context: Context) : View(context) {
         // painting an ink boundary as it goes. White blobs can escape before closure.
         if (activeTrail == null || orbitTargetId != target.id) {
             activeTrail?.let { previousTrail ->
+                // An abandoned, incomplete stroke fades as a line; never render it
+                // as a filled polygon or treat it as a capture.
                 previousTrail.closed = true
+                previousTrail.captures = false
                 previousTrail.age = 0f
             }
             orbitTargetId = target.id
@@ -614,7 +619,8 @@ class MeatballGameView(context: Context) : View(context) {
             if (closedByStart || connected) {
                 trail.closed = true
                 trail.age = 0f
-                captureInside(trail, now)
+                trail.captures = isValidCapturePolygon(trail.points, dp(18f) * dp(18f))
+                if (trail.captures) captureInside(trail, now)
                 activeTrail = null
                 orbitTargetId = null
             }
@@ -716,8 +722,63 @@ class MeatballGameView(context: Context) : View(context) {
         return false
     }
 
+    private fun isValidCapturePolygon(points: List<Pair<Float, Float>>, minArea: Float): Boolean {
+        if (points.size < 4) return false
+        if (polygonArea(points) < minArea) return false
+
+        // A self-crossing contour has ambiguous inside/outside regions. Reject it
+        // rather than unexpectedly capturing blobs in a malformed shape.
+        val segmentCount = points.size - 1
+        for (i in 0 until segmentCount) {
+            val a = points[i]
+            val b = points[i + 1]
+            for (j in i + 2 until segmentCount) {
+                // The first and last segments are adjacent for a closed ring.
+                if (i == 0 && j == segmentCount - 1) continue
+                val c = points[j]
+                val d = points[j + 1]
+                if (segmentsIntersect(a.first, a.second, b.first, b.second,
+                        c.first, c.second, d.first, d.second)) return false
+            }
+        }
+        return true
+    }
+
+    private fun polygonArea(points: List<Pair<Float, Float>>): Float {
+        var twiceArea = 0f
+        for (i in points.indices) {
+            val next = points[(i + 1) % points.size]
+            val current = points[i]
+            twiceArea += current.first * next.second - next.first * current.second
+        }
+        return abs(twiceArea) * .5f
+    }
+
+    private fun segmentsIntersect(
+        ax: Float, ay: Float, bx: Float, by: Float,
+        cx: Float, cy: Float, dx: Float, dy: Float
+    ): Boolean {
+        fun orientation(px: Float, py: Float, qx: Float, qy: Float, rx: Float, ry: Float): Float =
+            (qx - px) * (ry - py) - (qy - py) * (rx - px)
+        fun onSegment(px: Float, py: Float, qx: Float, qy: Float, rx: Float, ry: Float): Boolean =
+            rx >= min(px, qx) - .01f && rx <= max(px, qx) + .01f &&
+                ry >= min(py, qy) - .01f && ry <= max(py, qy) + .01f
+
+        val o1 = orientation(ax, ay, bx, by, cx, cy)
+        val o2 = orientation(ax, ay, bx, by, dx, dy)
+        val o3 = orientation(cx, cy, dx, dy, ax, ay)
+        val o4 = orientation(cx, cy, dx, dy, bx, by)
+        if ((o1 > 0f && o2 < 0f || o1 < 0f && o2 > 0f) &&
+            (o3 > 0f && o4 < 0f || o3 < 0f && o4 > 0f)) return true
+        if (abs(o1) < .01f && onSegment(ax, ay, bx, by, cx, cy)) return true
+        if (abs(o2) < .01f && onSegment(ax, ay, bx, by, dx, dy)) return true
+        if (abs(o3) < .01f && onSegment(cx, cy, dx, dy, ax, ay)) return true
+        if (abs(o4) < .01f && onSegment(cx, cy, dx, dy, bx, by)) return true
+        return false
+    }
+
     private fun captureInside(trail: InkTrail, now: Long) {
-        if (trail.points.size < 4) return
+        if (trail.points.size < 4 || !trail.captures) return
         val captured = survivors.filter { pointInsidePolygon(it.x, it.y, trail.points) }
         captured.forEach { survivor ->
             survivors.remove(survivor)
