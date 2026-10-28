@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
@@ -19,13 +20,16 @@ private data class Survivor(
     var y: Float,
     var vx: Float = 0f,
     var vy: Float = 0f,
-    var panic: Float = 0f
+    var panic: Float = 0f,
+    var mass: Float = 1f,
+    var mergePulse: Float = 0f
 )
 
 class MeatballGameView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private fun dp(value: Float) = value * density
     private val survivorRadius get() = dp(17f)
+    private fun radiusFor(survivor: Survivor) = survivorRadius * sqrt(survivor.mass)
     private val hunterRadius get() = dp(29f)
     private val survivors = mutableListOf<Survivor>()
     private val random = Random(System.nanoTime())
@@ -45,6 +49,7 @@ class MeatballGameView(context: Context) : View(context) {
     private var arena = RectF()
     private val restart = RectF()
     private val walls = mutableListOf<RectF>()
+    private var arenaNeedsLayout = true
 
     private val background = Color.rgb(250, 249, 246)
     private val ink = Color.rgb(20, 20, 22)
@@ -80,6 +85,7 @@ class MeatballGameView(context: Context) : View(context) {
         lastFrame = 0L
         hunterVx = 0f
         hunterVy = 0f
+        arenaNeedsLayout = true
         // Initial positions are replaced with arena-relative positions on the first layout.
         invalidate()
     }
@@ -94,51 +100,94 @@ class MeatballGameView(context: Context) : View(context) {
 
     private fun setupArena() {
         val margin = dp(18f)
-        val hudBottom = dp(92f)
-        arena.set(margin, hudBottom, width - margin, height - dp(72f))
+        val nextLeft = margin
+        val nextTop = dp(92f)
+        val nextRight = width - margin
+        val nextBottom = height - dp(72f)
+        if (nextRight - nextLeft <= dp(100f) || nextBottom - nextTop <= dp(150f)) return
+
+        val changed = arenaNeedsLayout ||
+            abs(arena.left - nextLeft) > dp(1f) ||
+            abs(arena.top - nextTop) > dp(1f) ||
+            abs(arena.right - nextRight) > dp(1f) ||
+            abs(arena.bottom - nextBottom) > dp(1f)
+        if (!changed) return
+
+        arena.set(nextLeft, nextTop, nextRight, nextBottom)
         walls.clear()
         val w = arena.width()
         val h = arena.height()
-        if (w <= dp(100f) || h <= dp(150f)) return
-        // Rounded solid obstacles create corners, cover, and alternative routes.
-        walls += RectF(arena.left + w * .28f, arena.top + h * .19f,
-            arena.left + w * .37f, arena.top + h * .48f)
-        walls += RectF(arena.left + w * .62f, arena.top + h * .50f,
-            arena.left + w * .72f, arena.top + h * .79f)
-        walls += RectF(arena.left + w * .43f, arena.top + h * .68f,
-            arena.left + w * .57f, arena.top + h * .74f)
+
+        // Build a fresh, varied layout only on first layout, resize, or restart.
+        // Keep obstacles separated so the hunter always has room to route around them.
+        val desiredCount = 4 + random.nextInt(3)
+        var attempts = 0
+        while (walls.size < desiredCount && attempts < 100) {
+            attempts++
+            val obstacleW = w * (.07f + random.nextFloat() * .075f)
+            val obstacleH = h * (.07f + random.nextFloat() * .12f)
+            val left = arena.left + dp(24f) + random.nextFloat() * (w - obstacleW - dp(48f))
+            val top = arena.top + dp(24f) + random.nextFloat() * (h - obstacleH - dp(48f))
+            val candidate = RectF(left, top, left + obstacleW, top + obstacleH)
+            val expanded = RectF(candidate.left - hunterRadius - dp(12f),
+                candidate.top - hunterRadius - dp(12f),
+                candidate.right + hunterRadius + dp(12f),
+                candidate.bottom + hunterRadius + dp(12f))
+            val overlaps = walls.any { existing ->
+                val e = RectF(existing.left - hunterRadius, existing.top - hunterRadius,
+                    existing.right + hunterRadius, existing.bottom + hunterRadius)
+                RectF.intersects(expanded, e)
+            }
+            // Leave the central area open enough that routes can connect around obstacles.
+            val centerKeepout = RectF(arena.centerX() - w * .08f, arena.centerY() - h * .08f,
+                arena.centerX() + w * .08f, arena.centerY() + h * .08f)
+            if (!overlaps && !RectF.intersects(candidate, centerKeepout)) walls += candidate
+        }
+
         if (survivors.isEmpty() && !running && !finished) {
-            val positions = listOf(
-                .13f to .22f, .76f to .18f, .85f to .40f,
-                .16f to .58f, .47f to .35f, .82f to .86f
-            )
-            positions.forEach { (px, py) ->
-                val point = findFreePoint(arena.left + w * px, arena.top + h * py, survivorRadius)
+            repeat(6) {
+                val point = findFreePoint(
+                    arena.left + dp(28f) + random.nextFloat() * (w - dp(56f)),
+                    arena.top + dp(28f) + random.nextFloat() * (h - dp(56f)),
+                    survivorRadius
+                )
                 survivors += Survivor(nextId++, point.first, point.second)
             }
-            val hp = findFreePoint(arena.left + w * .50f, arena.top + h * .16f, hunterRadius)
+            val hp = findFreePoint(arena.centerX(), arena.top + h * .14f, hunterRadius)
+            hunterX = hp.first
+            hunterY = hp.second
+        } else {
+            survivors.forEach { s ->
+                val p = collideWithArena(s.x, s.y, radiusFor(s))
+                s.x = p.first
+                s.y = p.second
+            }
+            val hp = collideWithArena(hunterX, hunterY, hunterRadius)
             hunterX = hp.first
             hunterY = hp.second
         }
+        arenaNeedsLayout = false
     }
 
     private fun findFreePoint(x: Float, y: Float, radius: Float): Pair<Float, Float> {
-        var px = x.coerceIn(arena.left + radius, arena.right - radius)
-        var py = y.coerceIn(arena.top + radius, arena.bottom - radius)
-        repeat(8) {
-            val obstacle = walls.firstOrNull { rect ->
+        fun isFree(px: Float, py: Float): Boolean {
+            if (px < arena.left + radius || px > arena.right - radius ||
+                py < arena.top + radius || py > arena.bottom - radius) return false
+            return walls.none { rect ->
                 val cx = px.coerceIn(rect.left, rect.right)
                 val cy = py.coerceIn(rect.top, rect.bottom)
                 val dx = px - cx
                 val dy = py - cy
-                dx * dx + dy * dy < radius * radius
-            }
-            if (obstacle != null) {
-                px = (obstacle.right + radius + dp(8f)).coerceAtMost(arena.right - radius)
-                py = (obstacle.bottom + radius + dp(8f)).coerceAtMost(arena.bottom - radius)
+                dx * dx + dy * dy < (radius + dp(3f)) * (radius + dp(3f))
             }
         }
-        return px to py
+        if (isFree(x, y)) return x to y
+        repeat(100) {
+            val px = arena.left + radius + random.nextFloat() * (arena.width() - radius * 2f)
+            val py = arena.top + radius + random.nextFloat() * (arena.height() - radius * 2f)
+            if (isFree(px, py)) return px to py
+        }
+        return arena.centerX() to arena.centerY()
     }
 
     private fun collideWithArena(x: Float, y: Float, radius: Float): Pair<Float, Float> {
@@ -237,9 +286,32 @@ class MeatballGameView(context: Context) : View(context) {
             hunterX + hunterRadius * .22f, hunterY + hunterRadius * .38f), 15f, 150f, false, angry)
 
         survivors.forEach { survivor ->
-            val r = survivorRadius * (if (survivor.id == selectedId) 1.08f else 1f)
-            canvas.drawCircle(survivor.x, survivor.y, r, survivorPaint)
-            canvas.drawCircle(survivor.x, survivor.y, r, outlinePaint)
+            val r = radiusFor(survivor) * (if (survivor.id == selectedId) 1.08f else 1f)
+            // A wobbling closed contour makes each blob feel soft instead of like a rigid circle.
+            val now = System.currentTimeMillis()
+            val points = 28
+            val contour = Path()
+            for (i in 0 until points) {
+                val angle = (i.toFloat() / points) * (Math.PI * 2.0).toFloat()
+                val wobble = 1f +
+                    .055f * kotlin.math.sin(angle * 3f + now / 170.0 + survivor.id).toFloat() +
+                    .035f * kotlin.math.sin(angle * 5f - now / 230.0 + survivor.mass).toFloat()
+                val px = survivor.x + kotlin.math.cos(angle.toDouble()).toFloat() * r * wobble
+                val py = survivor.y + kotlin.math.sin(angle.toDouble()).toFloat() * r * wobble
+                if (i == 0) contour.moveTo(px, py) else contour.lineTo(px, py)
+            }
+            contour.close()
+            canvas.drawPath(contour, survivorPaint)
+            canvas.drawPath(contour, outlinePaint)
+            if (survivor.mergePulse > 0f) {
+                val pulsePaint = Paint(3).apply {
+                    color = Color.rgb(105, 185, 225)
+                    style = Paint.Style.STROKE
+                    strokeWidth = dp(2f)
+                    alpha = (survivor.mergePulse * 180f).toInt().coerceIn(0, 180)
+                }
+                canvas.drawCircle(survivor.x, survivor.y, r + dp(5f + 18f * (1f - survivor.mergePulse)), pulsePaint)
+            }
             if (survivor.panic > 0.15f) {
                 val panicPaint = Paint(3).apply {
                     color = Color.rgb(220, 70, 70)
@@ -290,14 +362,14 @@ class MeatballGameView(context: Context) : View(context) {
     }
 
 
-    // Sample a segment against walls expanded by the hunter's radius. Sampling
-    // at short intervals prevents the hunter from choosing a route through a wall.
+    // Test the hunter's centre line against walls expanded by its radius.
+    // Fine sampling includes both endpoints to avoid routes that cut wall corners.
     private fun pathBlocked(x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
         val dx = x2 - x1
         val dy = y2 - y1
         val distance = sqrt(dx * dx + dy * dy)
-        val steps = max(1, (distance / dp(7f)).toInt())
-        for (i in 1 until steps) {
+        val steps = max(2, kotlin.math.ceil(distance / dp(4f)).toInt())
+        for (i in 0..steps) {
             val t = i.toFloat() / steps
             val px = x1 + dx * t
             val py = y1 + dy * t
@@ -309,16 +381,46 @@ class MeatballGameView(context: Context) : View(context) {
         return false
     }
 
-    private fun hunterSteeringTarget(targetX: Float, targetY: Float): Pair<Float, Float> {
-        if (!pathBlocked(hunterX, hunterY, targetX, targetY)) return targetX to targetY
+    private fun routeGoal(targetX: Float, targetY: Float): Pair<Float, Float> {
+        var gx = targetX
+        var gy = targetY
+        // A survivor can stand closer to a wall than the hunter can. Project the
+        // destination out of the hunter's clearance zone so the route has a valid end.
+        repeat(walls.size + 1) {
+            walls.forEach { wall ->
+                val left = wall.left - hunterRadius - dp(3f)
+                val right = wall.right + hunterRadius + dp(3f)
+                val top = wall.top - hunterRadius - dp(3f)
+                val bottom = wall.bottom + hunterRadius + dp(3f)
+                if (gx >= left && gx <= right && gy >= top && gy <= bottom) {
+                    val options = listOf(
+                        (abs(gx - left)) to (left to gy),
+                        (abs(right - gx)) to (right to gy),
+                        (abs(gy - top)) to (gx to top),
+                        (abs(bottom - gy)) to (gx to bottom)
+                    )
+                    val best = options.minByOrNull { it.first }!!.second
+                    gx = best.first
+                    gy = best.second
+                }
+            }
+        }
+        gx = gx.coerceIn(arena.left + hunterRadius, arena.right - hunterRadius)
+        gy = gy.coerceIn(arena.top + hunterRadius, arena.bottom - hunterRadius)
+        return gx to gy
+    }
 
-        val padding = hunterRadius + dp(10f)
-        val candidates = walls.flatMap { wall ->
+    private fun hunterSteeringTarget(targetX: Float, targetY: Float): Pair<Float, Float> {
+        val goal = routeGoal(targetX, targetY)
+        if (!pathBlocked(hunterX, hunterY, goal.first, goal.second)) return goal
+
+        val clearance = hunterRadius + dp(8f)
+        val corners = walls.flatMap { wall ->
             listOf(
-                (wall.left - padding) to (wall.top - padding),
-                (wall.right + padding) to (wall.top - padding),
-                (wall.left - padding) to (wall.bottom + padding),
-                (wall.right + padding) to (wall.bottom + padding)
+                (wall.left - clearance) to (wall.top - clearance),
+                (wall.right + clearance) to (wall.top - clearance),
+                (wall.left - clearance) to (wall.bottom + clearance),
+                (wall.right + clearance) to (wall.bottom + clearance)
             )
         }.filter { (x, y) ->
             x >= arena.left + hunterRadius && x <= arena.right - hunterRadius &&
@@ -326,20 +428,99 @@ class MeatballGameView(context: Context) : View(context) {
                 walls.none { wall ->
                     x >= wall.left - hunterRadius && x <= wall.right + hunterRadius &&
                         y >= wall.top - hunterRadius && y <= wall.bottom + hunterRadius
-                } &&
-                !pathBlocked(hunterX, hunterY, x, y) &&
-                !pathBlocked(x, y, targetX, targetY)
+                }
         }
 
-        val waypoint = candidates.minByOrNull { (x, y) ->
-            val a = sqrt((x - hunterX) * (x - hunterX) + (y - hunterY) * (y - hunterY))
-            val b = sqrt((targetX - x) * (targetX - x) + (targetY - y) * (targetY - y))
-            a + b
+        // Visibility graph + Dijkstra: choose the first waypoint on the shortest
+        // collision-free route, not just a corner that happens to look promising.
+        val nodes = mutableListOf(hunterX to hunterY, goal)
+        corners.forEach { corner ->
+            if (nodes.none { abs(it.first - corner.first) < dp(1f) && abs(it.second - corner.second) < dp(1f) }) {
+                nodes += corner
+            }
         }
-        return waypoint ?: (targetX to targetY)
+        val count = nodes.size
+        val distances = FloatArray(count) { Float.POSITIVE_INFINITY }
+        val previous = IntArray(count) { -1 }
+        val visited = BooleanArray(count)
+        distances[0] = 0f
+        repeat(count) {
+            var current = -1
+            var best = Float.POSITIVE_INFINITY
+            for (i in 0 until count) {
+                if (!visited[i] && distances[i] < best) {
+                    best = distances[i]
+                    current = i
+                }
+            }
+            if (current < 0) return@repeat
+            if (current == 1) return@repeat
+            visited[current] = true
+            for (next in 1 until count) {
+                if (next == current || visited[next]) continue
+                val a = nodes[current]
+                val b = nodes[next]
+                if (pathBlocked(a.first, a.second, b.first, b.second)) continue
+                val dx = b.first - a.first
+                val dy = b.second - a.second
+                val candidate = distances[current] + sqrt(dx * dx + dy * dy)
+                if (candidate < distances[next]) {
+                    distances[next] = candidate
+                    previous[next] = current
+                }
+            }
+        }
+        if (!distances[1].isFinite()) {
+            // The random generator keeps routes open; if a rare corner case remains,
+            // move toward the closest reachable corner rather than pushing into a wall.
+            return corners.filterNot { pathBlocked(hunterX, hunterY, it.first, it.second) }
+                .minByOrNull { (x, y) ->
+                    val tx = goal.first - x
+                    val ty = goal.second - y
+                    tx * tx + ty * ty
+                } ?: (hunterX to hunterY)
+        }
+        var step = 1
+        while (previous[step] > 0) step = previous[step]
+        return nodes[step]
+    }
+
+    private fun mergeNearbySurvivors() {
+        var changed = true
+        while (changed) {
+            changed = false
+            outer@ for (i in survivors.indices) {
+                for (j in i + 1 until survivors.size) {
+                    val a = survivors[i]
+                    val b = survivors[j]
+                    val dx = b.x - a.x
+                    val dy = b.y - a.y
+                    val combinedRadius = radiusFor(a) + radiusFor(b)
+                    if (dx * dx + dy * dy < combinedRadius * combinedRadius * .72f) {
+                        val keep = if (selectedId == b.id) b else a
+                        val lose = if (keep === a) b else a
+                        val total = a.mass + b.mass
+                        keep.x = (a.x * a.mass + b.x * b.mass) / total
+                        keep.y = (a.y * a.mass + b.y * b.mass) / total
+                        keep.vx = (a.vx * a.mass + b.vx * b.mass) / total
+                        keep.vy = (a.vy * a.mass + b.vy * b.mass) / total
+                        keep.mass = (total).coerceAtMost(5f)
+                        keep.mergePulse = 1f
+                        if (selectedId == lose.id) selectedId = keep.id
+                        survivors.remove(lose)
+                        val safe = collideWithArena(keep.x, keep.y, radiusFor(keep))
+                        keep.x = safe.first
+                        keep.y = safe.second
+                        changed = true
+                        break@outer
+                    }
+                }
+            }
+        }
     }
 
     private fun updateGame(dt: Float, now: Long) {
+        mergeNearbySurvivors()
         if (survivors.isEmpty()) {
             running = false
             finished = true
@@ -375,13 +556,14 @@ class MeatballGameView(context: Context) : View(context) {
                 val desiredY = -ty / dist * dp(46f) * flee + wanderY
                 s.vx += (desiredX - s.vx) * min(1f, dt * 3f)
                 s.vy += (desiredY - s.vy) * min(1f, dt * 3f)
-                val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, survivorRadius)
+                val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, radiusFor(s))
                 s.x = next.first
                 s.y = next.second
             }
+            s.mergePulse = (s.mergePulse - dt * 1.6f).coerceAtLeast(0f)
             val cx = s.x - hunterX
             val cy = s.y - hunterY
-            if (cx * cx + cy * cy < (hunterRadius + survivorRadius * .62f).let { it * it }) {
+            if (cx * cx + cy * cy < (hunterRadius + radiusFor(s) * .62f).let { it * it }) {
                 survivors.remove(s)
                 if (selectedId == s.id) {
                     selectedId = null
@@ -415,7 +597,7 @@ class MeatballGameView(context: Context) : View(context) {
                 if (target != null) {
                     val dx = target.x - x
                     val dy = target.y - y
-                    if (dx * dx + dy * dy < dp(42f) * dp(42f)) {
+                    if (dx * dx + dy * dy < (radiusFor(target) + dp(25f)).let { it * it }) {
                         selectedId = target.id
                         dragging = true
                     }
@@ -427,7 +609,7 @@ class MeatballGameView(context: Context) : View(context) {
                 if (dragging) {
                     val s = survivors.firstOrNull { it.id == selectedId }
                     if (s != null) {
-                        val point = collideWithArena(x, y, survivorRadius)
+                        val point = collideWithArena(x, y, radiusFor(s))
                         s.x = point.first
                         s.y = point.second
                         s.vx = 0f
