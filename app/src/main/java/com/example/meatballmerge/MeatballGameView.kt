@@ -694,7 +694,7 @@ class MeatballGameView(context: Context) : View(context) {
         }
         val safeRadius = hunterRadius + radiusFor(target) + dp(30f)
         // A slightly faster, tighter orbit makes capture loops close reliably on mobile.
-        orbitAngle += dt * 0.8f
+        orbitAngle += dt * (0.8f + (level - 1) * 0.06f)
         val orbitX = orbitCenterX + kotlin.math.cos(orbitAngle) * safeRadius
         val orbitY = orbitCenterY + kotlin.math.sin(orbitAngle) * safeRadius
         val dx = orbitX - hunterX
