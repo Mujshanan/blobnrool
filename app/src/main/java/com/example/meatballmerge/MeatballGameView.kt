@@ -726,17 +726,16 @@ class MeatballGameView(context: Context) : View(context) {
         if (points.size < 4) return false
         if (polygonArea(points) < minArea) return false
 
-        // A self-crossing contour has ambiguous inside/outside regions. Reject it
-        // rather than unexpectedly capturing blobs in a malformed shape.
-        val segmentCount = points.size - 1
-        for (i in 0 until segmentCount) {
+        // Test every edge, including the implicit edge from the final point back
+        // to the first. Adjacent edges share a vertex by design and are skipped.
+        val edgeCount = points.size
+        for (i in 0 until edgeCount) {
             val a = points[i]
-            val b = points[i + 1]
-            for (j in i + 2 until segmentCount) {
-                // The first and last segments are adjacent for a closed ring.
-                if (i == 0 && j == segmentCount - 1) continue
+            val b = points[(i + 1) % edgeCount]
+            for (j in i + 1 until edgeCount) {
+                if (j == i + 1 || (i == 0 && j == edgeCount - 1)) continue
                 val c = points[j]
-                val d = points[j + 1]
+                val d = points[(j + 1) % edgeCount]
                 if (segmentsIntersect(a.first, a.second, b.first, b.second,
                         c.first, c.second, d.first, d.second)) return false
             }
