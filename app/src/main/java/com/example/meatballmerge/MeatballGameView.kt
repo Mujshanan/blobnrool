@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
@@ -14,218 +13,359 @@ import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-private data class Blob(val id: Int, var x: Float, var y: Float)
+private data class Survivor(
+    val id: Int,
+    var x: Float,
+    var y: Float,
+    var vx: Float = 0f,
+    var vy: Float = 0f,
+    var panic: Float = 0f
+)
 
 class MeatballGameView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
-    private fun dp(v: Float) = v * density
-    private val radius get() = dp(31f)
-    private val blobs = mutableListOf<Blob>()
-    private val total = 12
-    private val interval = 1150L
-    private var spawned = 0
+    private fun dp(value: Float) = value * density
+    private val survivorRadius get() = dp(17f)
+    private val hunterRadius get() = dp(29f)
+    private val survivors = mutableListOf<Survivor>()
+    private val random = Random(System.nanoTime())
     private var nextId = 0
-    private var selected: Int? = null
-    private var dx = 0f
-    private var dy = 0f
-    private var startTime = 0L
-    private var lastSpawn = 0L
+    private var selectedId: Int? = null
+    private var dragging = false
     private var running = false
     private var finished = false
-    private var best = Long.MAX_VALUE
-    private var left = 0f
-    private var top = 0f
-    private var right = 0f
-    private var bottom = 0f
+    private var lastFrame = 0L
+    private var startTime = 0L
+    private var finalTime = 0L
+    private var bestTime = Long.MAX_VALUE
+    private var hunterX = 0f
+    private var hunterY = 0f
+    private var hunterVx = 0f
+    private var hunterVy = 0f
+    private var arena = RectF()
     private val restart = RectF()
-    private val random = Random(System.nanoTime())
+    private val walls = mutableListOf<RectF>()
 
-    private val fill = Paint(3).apply { color = Color.rgb(187, 82, 42); style = Paint.Style.FILL }
-    private val edge = Paint(3).apply { color = Color.rgb(247, 184, 121); style = Paint.Style.STROKE; strokeWidth = dp(2f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
-    private val highlight = Paint(3).apply { color = Color.rgb(229, 139, 83) }
-    private val panel = Paint(3).apply { color = Color.rgb(34, 39, 53) }
-    private val grid = Paint(3).apply { color = Color.argb(28, 220, 225, 245); strokeWidth = dp(1f) }
-    private val white = Paint(3).apply { color = Color.WHITE; textSize = dp(17f); typeface = android.graphics.Typeface.create("sans-serif-medium", 0) }
-    private val muted = Paint(3).apply { color = Color.rgb(180, 188, 207); textSize = dp(12f) }
-    private val title = Paint(3).apply { color = Color.WHITE; textSize = dp(26f); typeface = android.graphics.Typeface.create("sans-serif-black", 0) }
-    private val button = Paint(3).apply { color = Color.rgb(232, 117, 58) }
-    private val buttonText = Paint(3).apply { color = Color.WHITE; textSize = dp(14f); textAlign = Paint.Align.CENTER }
+    private val background = Color.rgb(250, 249, 246)
+    private val ink = Color.rgb(20, 20, 22)
+    private val gray = Color.rgb(115, 115, 115)
+    private val faint = Color.rgb(231, 229, 224)
+    private val wallPaint = Paint(3).apply { color = ink; style = Paint.Style.FILL }
+    private val survivorPaint = Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL }
+    private val outlinePaint = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(2f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    private val inkPaint = Paint(3).apply { color = ink; style = Paint.Style.FILL }
+    private val whitePaint = Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL }
+    private val facePaint = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(1.8f); strokeCap = Paint.Cap.ROUND }
+    private val titlePaint = Paint(3).apply { color = ink; textSize = dp(24f); typeface = android.graphics.Typeface.create("sans-serif-black", 0) }
+    private val textPaint = Paint(3).apply { color = ink; textSize = dp(14f); typeface = android.graphics.Typeface.create("sans-serif-medium", 0) }
+    private val smallPaint = Paint(3).apply { color = gray; textSize = dp(11f) }
+    private val buttonPaint = Paint(3).apply { color = ink; style = Paint.Style.FILL }
+    private val buttonText = Paint(3).apply { color = Color.WHITE; textSize = dp(12f); textAlign = Paint.Align.CENTER; typeface = android.graphics.Typeface.create("sans-serif-medium", 0) }
+    private val gridPaint = Paint(3).apply { color = faint; strokeWidth = dp(1f) }
+
+    init {
+        isFocusable = true
+        reset()
+    }
 
     private fun reset() {
-        blobs.clear(); spawned = 0; nextId = 0; selected = null
-        startTime = 0L; lastSpawn = 0L; running = false; finished = false
+        survivors.clear()
+        nextId = 0
+        selectedId = null
+        dragging = false
+        running = false
+        finished = false
+        startTime = 0L
+        finalTime = 0L
+        lastFrame = 0L
+        hunterVx = 0f
+        hunterVy = 0f
+        // Initial positions are replaced with arena-relative positions on the first layout.
         invalidate()
     }
 
-    private fun elapsed(now: Long = System.currentTimeMillis()) =
-        if (startTime == 0L) 0L else (if (finished) lastSpawn else now) - startTime
+    private fun elapsed(now: Long = System.currentTimeMillis()): Long {
+        if (startTime == 0L) return 0L
+        return (if (finished) finalTime else now) - startTime
+    }
 
-    private fun time(ms: Long) = "%02d:%02d.%d".format(ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100)
+    private fun formatTime(ms: Long): String =
+        "%02d:%02d".format(ms / 60000, (ms / 1000) % 60)
 
-    override fun onDraw(c: Canvas) {
-        super.onDraw(c)
-        c.drawColor(Color.rgb(23, 26, 36))
-        val w = width.toFloat(); val h = height.toFloat(); val margin = dp(20f)
-        c.drawText("BLOB'N'ROLL", margin, dp(44f), title)
-        white.textAlign = Paint.Align.RIGHT
-        c.drawText(time(elapsed()), w - margin, dp(43f), white)
-        muted.textAlign = Paint.Align.RIGHT
-        c.drawText("TIME", w - margin, dp(62f), muted)
-        white.textAlign = Paint.Align.LEFT; muted.textAlign = Paint.Align.LEFT
-
-        val cardTop = dp(65f)
-        c.drawRoundRect(margin, cardTop, w - margin, cardTop + dp(48f), dp(12f), dp(12f), panel)
-        c.drawText("BLOBS", margin + dp(13f), cardTop + dp(19f), muted)
-        c.drawText("${blobs.size} / $total", margin + dp(13f), cardTop + dp(39f), white)
-        val pl = margin + dp(105f); val pr = w - margin - dp(13f); val py = cardTop + dp(26f)
-        c.drawRoundRect(pl, py - dp(4f), pr, py + dp(4f), dp(4f), dp(4f), grid)
-        if (pr > pl) c.drawRoundRect(pl, py - dp(4f), pl + (pr - pl) * spawned / total, py + dp(4f), dp(4f), dp(4f), button)
-
-        left = margin + dp(2f); right = w - margin - dp(2f)
-        top = cardTop + dp(60f); bottom = h - dp(91f)
-        c.drawRoundRect(left, top, right, bottom, dp(20f), dp(20f), panel)
-        c.save(); c.clipRect(left, top, right, bottom)
-        var gx = left + dp(13f)
-        while (gx < right) { c.drawLine(gx, top, gx, bottom, grid); gx += dp(26f) }
-        var gy = top + dp(13f)
-        while (gy < bottom) { c.drawLine(left, gy, right, gy, grid); gy += dp(26f) }
-
-        // Marching Squares over the summed compact-support scalar field.
-        val step = dp(6f); val iso = 0.04f; val support = radius * 1.02f
-        if (blobs.isNotEmpty()) {
-            val x0 = max(left, blobs.minOf { it.x } - support - step)
-            val y0 = max(top, blobs.minOf { it.y } - support - step)
-            val x1 = min(right, blobs.maxOf { it.x } + support + step)
-            val y1 = min(bottom, blobs.maxOf { it.y } + support + step)
-            val cols = max(2, ((x1 - x0) / step).toInt() + 1)
-            val rows = max(2, ((y1 - y0) / step).toInt() + 1)
-            val values = Array(rows) { FloatArray(cols) }
-            fun sample(x: Float, y: Float): Float {
-                var v = 0f
-                for (b in blobs) {
-                    val ax = x - b.x; val ay = y - b.y; val d2 = ax * ax + ay * ay
-                    if (d2 < support * support) v += 1f - d2 / (support * support)
-                }
-                return v
+    private fun setupArena() {
+        val margin = dp(18f)
+        val hudBottom = dp(92f)
+        arena.set(margin, hudBottom, width - margin, height - dp(72f))
+        walls.clear()
+        val w = arena.width()
+        val h = arena.height()
+        if (w <= dp(100f) || h <= dp(150f)) return
+        // Rounded solid obstacles create corners, cover, and alternative routes.
+        walls += RectF(arena.left + w * .28f, arena.top + h * .19f,
+            arena.left + w * .37f, arena.top + h * .48f)
+        walls += RectF(arena.left + w * .62f, arena.top + h * .50f,
+            arena.left + w * .72f, arena.top + h * .79f)
+        walls += RectF(arena.left + w * .43f, arena.top + h * .68f,
+            arena.left + w * .57f, arena.top + h * .74f)
+        if (survivors.isEmpty() && !running && !finished) {
+            val positions = listOf(
+                .13f to .22f, .76f to .18f, .85f to .40f,
+                .16f to .58f, .47f to .35f, .82f to .86f
+            )
+            positions.forEach { (px, py) ->
+                val point = findFreePoint(arena.left + w * px, arena.top + h * py, survivorRadius)
+                survivors += Survivor(nextId++, point.first, point.second)
             }
-            for (j in 0 until rows) for (i in 0 until cols)
-                values[j][i] = sample(min(x1, x0 + i * step), min(y1, y0 + j * step))
-            val contour = Path()
-            fun px(i: Int) = min(x1, x0 + i * step)
-            fun py2(j: Int) = min(y1, y0 + j * step)
-            fun crossing(ax: Float, ay: Float, bx: Float, by: Float, va: Float, vb: Float): Pair<Float, Float> {
-                val t = if (abs(vb - va) < 0.00001f) 0.5f else ((iso - va) / (vb - va)).coerceIn(0f, 1f)
-                return Pair(ax + (bx - ax) * t, ay + (by - ay) * t)
+            val hp = findFreePoint(arena.left + w * .50f, arena.top + h * .16f, hunterRadius)
+            hunterX = hp.first
+            hunterY = hp.second
+        }
+    }
+
+    private fun findFreePoint(x: Float, y: Float, radius: Float): Pair<Float, Float> {
+        var px = x.coerceIn(arena.left + radius, arena.right - radius)
+        var py = y.coerceIn(arena.top + radius, arena.bottom - radius)
+        repeat(8) {
+            val obstacle = walls.firstOrNull { rect ->
+                val cx = px.coerceIn(rect.left, rect.right)
+                val cy = py.coerceIn(rect.top, rect.bottom)
+                val dx = px - cx
+                val dy = py - cy
+                dx * dx + dy * dy < radius * radius
             }
-            for (j in 0 until rows - 1) for (i in 0 until cols - 1) {
-                val xs = floatArrayOf(px(i), px(i + 1), px(i + 1), px(i))
-                val ys = floatArrayOf(py2(j), py2(j), py2(j + 1), py2(j + 1))
-                val vs = floatArrayOf(values[j][i], values[j][i + 1], values[j + 1][i + 1], values[j + 1][i])
-                val points = arrayOfNulls<Pair<Float, Float>>(4)
-                val pairs = arrayOf(0 to 1, 1 to 2, 2 to 3, 3 to 0)
-                for (e in 0..3) {
-                    val (a, b) = pairs[e]
-                    if ((vs[a] >= iso) != (vs[b] >= iso))
-                        points[e] = crossing(xs[a], ys[a], xs[b], ys[b], vs[a], vs[b])
-                }
-                val active = points.indices.filter { points[it] != null }
-                if (active.size >= 2) {
-                    for (k in 0 until active.size - 1 step 2) {
-                        val a = points[active[k]]!!; val b = points[active[k + 1]]!!
-                        contour.moveTo(a.first, a.second); contour.lineTo(b.first, b.second)
+            if (obstacle != null) {
+                px = (obstacle.right + radius + dp(8f)).coerceAtMost(arena.right - radius)
+                py = (obstacle.bottom + radius + dp(8f)).coerceAtMost(arena.bottom - radius)
+            }
+        }
+        return px to py
+    }
+
+    private fun collideWithArena(x: Float, y: Float, radius: Float): Pair<Float, Float> {
+        var px = x.coerceIn(arena.left + radius, arena.right - radius)
+        var py = y.coerceIn(arena.top + radius, arena.bottom - radius)
+        walls.forEach { r ->
+            val cx = px.coerceIn(r.left, r.right)
+            val cy = py.coerceIn(r.top, r.bottom)
+            val dx = px - cx
+            val dy = py - cy
+            val d2 = dx * dx + dy * dy
+            if (d2 < radius * radius) {
+                if (d2 > .01f) {
+                    val d = sqrt(d2)
+                    val push = radius - d
+                    px += dx / d * push
+                    py += dy / d * push
+                } else {
+                    val leftGap = abs(px - r.left)
+                    val rightGap = abs(r.right - px)
+                    val topGap = abs(py - r.top)
+                    val bottomGap = abs(r.bottom - py)
+                    val smallest = min(min(leftGap, rightGap), min(topGap, bottomGap))
+                    when (smallest) {
+                        leftGap -> px = r.left - radius
+                        rightGap -> px = r.right + radius
+                        topGap -> py = r.top - radius
+                        else -> py = r.bottom + radius
                     }
                 }
             }
-            // The filled disks under the contour strokes make the field read as one organic mass.
-            for (b in blobs) c.drawCircle(b.x, b.y, radius * 0.82f, fill)
-            c.drawPath(contour, edge)
-            for (b in blobs) c.drawCircle(b.x - radius * .28f, b.y - radius * .32f, radius * .12f, highlight)
         }
-        c.restore()
+        return px.coerceIn(arena.left + radius, arena.right - radius) to
+            py.coerceIn(arena.top + radius, arena.bottom - radius)
+    }
 
-        val footer = h - dp(68f)
-        muted.textAlign = Paint.Align.CENTER
-        if (finished) {
-            white.textAlign = Paint.Align.CENTER
-            c.drawText("BOARD CLEARED IN ${time(elapsed())}", w / 2f, footer - dp(12f), white)
-            c.drawText(if (best < Long.MAX_VALUE) "Best: ${time(best)}" else "Great run!", w / 2f, footer + dp(8f), muted)
-            white.textAlign = Paint.Align.LEFT
-        } else {
-            c.drawText(if (spawned == 0) "Touch to start · drag blobs together" else "Drag blobs together to clear the board", w / 2f, footer, muted)
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        canvas.drawColor(background)
+        setupArena()
+        canvas.drawText("BLOB'N'ROLL", dp(20f), dp(37f), titlePaint)
+        textPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText(formatTime(elapsed()), width - dp(20f), dp(35f), textPaint)
+        smallPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText("SURVIVAL", width - dp(20f), dp(52f), smallPaint)
+        textPaint.textAlign = Paint.Align.LEFT
+        smallPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText("SAVE THE WHITE BLOBS", dp(20f), dp(63f), smallPaint)
+
+        canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
+        canvas.save()
+        canvas.clipRect(arena)
+        var gx = arena.left + dp(20f)
+        while (gx < arena.right) {
+            canvas.drawLine(gx, arena.top, gx, arena.bottom, gridPaint)
+            gx += dp(28f)
         }
-        muted.textAlign = Paint.Align.LEFT
-        restart.set(w - margin - dp(104f), h - dp(48f), w - margin, h - dp(12f))
-        c.drawRoundRect(restart, dp(18f), dp(18f), button)
-        c.drawText("RESTART ↻", restart.centerX(), restart.centerY() + dp(5f), buttonText)
+        var gy = arena.top + dp(20f)
+        while (gy < arena.bottom) {
+            canvas.drawLine(arena.left, gy, arena.right, gy, gridPaint)
+            gy += dp(28f)
+        }
+
+        walls.forEach { r ->
+            canvas.drawRoundRect(r, dp(7f), dp(7f), wallPaint)
+        }
+        // Draw the ink hunter as an irregular-looking black mass with white eyes.
+        canvas.drawCircle(hunterX, hunterY, hunterRadius, inkPaint)
+        canvas.drawCircle(hunterX - hunterRadius * .27f, hunterY - hunterRadius * .15f,
+            hunterRadius * .10f, whitePaint)
+        canvas.drawCircle(hunterX + hunterRadius * .22f, hunterY - hunterRadius * .15f,
+            hunterRadius * .10f, whitePaint)
+        val angry = Paint(3).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dp(2f); strokeCap = Paint.Cap.ROUND }
+        canvas.drawLine(hunterX - hunterRadius * .42f, hunterY - hunterRadius * .38f,
+            hunterX - hunterRadius * .12f, hunterY - hunterRadius * .28f, angry)
+        canvas.drawLine(hunterX + hunterRadius * .08f, hunterY - hunterRadius * .28f,
+            hunterX + hunterRadius * .38f, hunterY - hunterRadius * .38f, angry)
+        canvas.drawArc(RectF(hunterX - hunterRadius * .22f, hunterY + hunterRadius * .05f,
+            hunterX + hunterRadius * .22f, hunterY + hunterRadius * .38f), 15f, 150f, false, angry)
+
+        survivors.forEach { survivor ->
+            val r = survivorRadius * (if (survivor.id == selectedId) 1.08f else 1f)
+            canvas.drawCircle(survivor.x, survivor.y, r, survivorPaint)
+            canvas.drawCircle(survivor.x, survivor.y, r, outlinePaint)
+            val eyeY = survivor.y - r * .14f
+            canvas.drawCircle(survivor.x - r * .27f, eyeY, r * .075f, inkPaint)
+            canvas.drawCircle(survivor.x + r * .27f, eyeY, r * .075f, inkPaint)
+            val face = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(1.5f); strokeCap = Paint.Cap.ROUND }
+            if (survivor.panic > .5f) {
+                canvas.drawCircle(survivor.x, survivor.y + r * .28f, r * .10f, face)
+            } else {
+                canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
+                    survivor.x + r * .22f, survivor.y + r * .36f), 15f, 150f, false, face)
+            }
+            if (survivor.id == selectedId) {
+                val ring = Paint(3).apply { color = Color.rgb(90, 145, 105); style = Paint.Style.STROKE; strokeWidth = dp(2f) }
+                canvas.drawCircle(survivor.x, survivor.y, r + dp(5f), ring)
+            }
+        }
+        canvas.restore()
+
+        val footerY = height - dp(43f)
+        val status = when {
+            finished -> "CAUGHT! Tap RESTART to try again"
+            running -> "Drag a white blob away from the ink"
+            else -> "Touch a white blob to begin"
+        }
+        smallPaint.textAlign = Paint.Align.CENTER
+        canvas.drawText(status, width / 2f, footerY, smallPaint)
+        smallPaint.textAlign = Paint.Align.LEFT
+        restart.set(width - dp(110f), height - dp(32f), width - dp(18f), height - dp(8f))
+        canvas.drawRoundRect(restart, dp(12f), dp(12f), buttonPaint)
+        canvas.drawText("RESTART", restart.centerX(), restart.centerY() + dp(4f), buttonText)
 
         if (running && !finished) {
             val now = System.currentTimeMillis()
-            if (spawned < total && now - lastSpawn >= interval) spawn(now)
-            if (spawned >= total && blobs.isEmpty()) finish(now)
+            if (lastFrame == 0L) lastFrame = now
+            val dt = ((now - lastFrame).coerceIn(1L, 32L) / 1000f)
+            lastFrame = now
+            updateGame(dt, now)
             postInvalidateOnAnimation()
         }
     }
 
-    private fun spawn(now: Long) {
-        if (spawned >= total) return
-        val safe = radius + dp(8f)
-        val minX = left + safe; val maxX = max(minX, right - safe)
-        val minY = top + safe; val maxY = max(minY, bottom - safe)
-        var x = minX + random.nextFloat() * (maxX - minX).coerceAtLeast(1f)
-        var y = minY + random.nextFloat() * (maxY - minY).coerceAtLeast(1f)
-        repeat(12) {
-            if (blobs.none { b -> (b.x - x) * (b.x - x) + (b.y - y) * (b.y - y) < radius * radius * 2f }) return@repeat
-            x = minX + random.nextFloat() * (maxX - minX).coerceAtLeast(1f)
-            y = minY + random.nextFloat() * (maxY - minY).coerceAtLeast(1f)
+    private fun updateGame(dt: Float, now: Long) {
+        if (survivors.isEmpty()) {
+            running = false
+            finished = true
+            finalTime = now
+            return
         }
-        blobs.add(Blob(nextId++, x, y)); spawned++; lastSpawn = now
-        if (startTime == 0L) startTime = now
-    }
+        val target = survivors.minByOrNull {
+            val dx = it.x - hunterX
+            val dy = it.y - hunterY
+            dx * dx + dy * dy
+        } ?: return
+        val dx = target.x - hunterX
+        val dy = target.y - hunterY
+        val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
+        val hunterSpeed = dp(54f)
+        hunterVx = dx / distance * hunterSpeed
+        hunterVy = dy / distance * hunterSpeed
+        val nextHunter = collideWithArena(hunterX + hunterVx * dt, hunterY + hunterVy * dt, hunterRadius)
+        hunterX = nextHunter.first
+        hunterY = nextHunter.second
 
-    private fun finish(now: Long) {
-        running = false; finished = true; lastSpawn = now
-        best = min(best, now - startTime)
-    }
-
-    override fun onTouchEvent(e: MotionEvent): Boolean {
-        val x = e.x; val y = e.y
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                if (restart.contains(x, y)) { reset(); return true }
-                if (!running && !finished) {
-                    running = true
-                    if (blobs.isEmpty()) spawn(System.currentTimeMillis())
-                }
-                val b = blobs.asReversed().firstOrNull {
-                    val ax = x - it.x; val ay = y - it.y
-                    ax * ax + ay * ay <= radius * radius * 1.8f
-                }
-                if (b != null) { selected = b.id; dx = b.x - x; dy = b.y - y }
-                invalidate(); return true
+        survivors.toList().forEach { s ->
+            val tx = s.x - hunterX
+            val ty = s.y - hunterY
+            val dist = sqrt(tx * tx + ty * ty).coerceAtLeast(1f)
+            s.panic = (1f - dist / dp(150f)).coerceIn(0f, 1f)
+            if (s.id != selectedId || !dragging) {
+                val flee = if (dist < dp(135f)) 1f else 0f
+                val wanderX = kotlin.math.sin((now / 700.0) + s.id).toFloat() * dp(12f)
+                val wanderY = kotlin.math.cos((now / 900.0) + s.id * 2).toFloat() * dp(12f)
+                val desiredX = -tx / dist * dp(46f) * flee + wanderX
+                val desiredY = -ty / dist * dp(46f) * flee + wanderY
+                s.vx += (desiredX - s.vx) * min(1f, dt * 3f)
+                s.vy += (desiredY - s.vy) * min(1f, dt * 3f)
+                val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, survivorRadius)
+                s.x = next.first
+                s.y = next.second
             }
-            MotionEvent.ACTION_MOVE -> {
-                val id = selected
-                if (id != null) {
-                    val b = blobs.firstOrNull { it.id == id }
-                    if (b != null) {
-                        b.x = (x + dx).coerceIn(left + radius * .7f, right - radius * .7f)
-                        b.y = (y + dy).coerceIn(top + radius * .7f, bottom - radius * .7f)
-                        val partner = blobs.firstOrNull { other ->
-                            if (other.id == b.id) false else {
-                                val ax = b.x - other.x; val ay = b.y - other.y
-                                sqrt(ax * ax + ay * ay) <= radius * 1.78f
-                            }
-                        }
-                        if (partner != null) {
-                            blobs.removeAll { it.id == b.id || it.id == partner.id }
-                            selected = null
-                            if (spawned >= total && blobs.isEmpty()) finish(System.currentTimeMillis())
-                        }
+            val cx = s.x - hunterX
+            val cy = s.y - hunterY
+            if (cx * cx + cy * cy < (hunterRadius + survivorRadius * .62f).let { it * it }) {
+                survivors.remove(s)
+                if (selectedId == s.id) {
+                    selectedId = null
+                    dragging = false
+                }
+            }
+        }
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val x = event.x
+        val y = event.y
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (restart.contains(x, y)) {
+                    reset()
+                    setupArena()
+                    invalidate()
+                    return true
+                }
+                if (!running && !finished && arena.contains(x, y)) {
+                    running = true
+                    startTime = System.currentTimeMillis()
+                    lastFrame = startTime
+                }
+                val target = survivors.minByOrNull {
+                    val dx = it.x - x
+                    val dy = it.y - y
+                    dx * dx + dy * dy
+                }
+                if (target != null) {
+                    val dx = target.x - x
+                    val dy = target.y - y
+                    if (dx * dx + dy * dy < dp(42f) * dp(42f)) {
+                        selectedId = target.id
+                        dragging = true
                     }
                 }
-                invalidate(); return true
+                invalidate()
+                return true
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { selected = null; invalidate(); return true }
+            MotionEvent.ACTION_MOVE -> {
+                if (dragging) {
+                    val s = survivors.firstOrNull { it.id == selectedId }
+                    if (s != null) {
+                        val point = collideWithArena(x, y, survivorRadius)
+                        s.x = point.first
+                        s.y = point.second
+                        s.vx = 0f
+                        s.vy = 0f
+                    }
+                }
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                dragging = false
+                selectedId = null
+                invalidate()
+                return true
+            }
         }
         return true
     }

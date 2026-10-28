@@ -1,11 +1,17 @@
-# Blob'n'Roll — Android prototype
+# Blob'n'Roll — Android survival prototype
 
-A native Android puzzle game about dragging organic blobs together. The game view samples a compact-support scalar field and uses **Marching Squares** to draw its contour. Drag blobs into one another to remove pairs and clear the 12-blob round as quickly as possible.
+Blob'n'Roll is a native Android arcade survival game prototype built with Kotlin and Android Canvas. Cute white blobs try to escape a pursuing evil ink blob inside a small obstacle-filled arena.
 
-## Gameplay
-- 12 same-size blobs spawn at random positions.
-- Touch and drag a blob; when it reaches another blob, the pair disappears.
-- Clear the board to finish the timer. Tap **RESTART** to play again.
+## Current prototype
+- Six white survivors with simple stroke-drawn faces.
+- An ink hunter that pursues the nearest survivor.
+- Touch and drag a white blob to guide it away from the hunter.
+- Solid walls and rounded obstacles block movement.
+- Survivors panic and try to flee when the ink approaches.
+- A survival timer, capture/game-over state, and restart button.
+- Lightweight native rendering with no third-party runtime libraries.
+
+This is an early gameplay prototype. Obstacle-aware pathfinding, dash attacks, splatter effects, temporary ink puddles, improved procedural blob contours, sound, and persistent high scores are planned follow-up work.
 
 ## Build an APK
 The repository includes a GitHub Actions workflow at `.github/workflows/android.yml`. It uses Java 17 and Gradle 8.9 to run `assembleDebug`, checks that the APK exists, and uploads it as the `blobnroll-debug-apk` artifact.
@@ -19,5 +25,5 @@ The expected output is `app/build/outputs/apk/debug/app-debug.apk`. This is a de
 
 ## Project
 - Kotlin and Android Canvas; no third-party runtime libraries.
-- `MeatballGameView.kt` contains the game, touch handling, timer and Marching Squares contour rendering.
+- `MeatballGameView.kt` contains the game loop, drawing, touch handling, simple AI, collisions, timer, and obstacle layout.
 - `MainActivity.kt` hosts the full-screen game view.
