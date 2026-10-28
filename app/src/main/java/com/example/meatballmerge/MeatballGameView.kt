@@ -55,6 +55,10 @@ class MeatballGameView(context: Context) : View(context) {
     private var hunterVx = 0f
     private var hunterVy = 0f
     private var arena = RectF()
+    // The playable world is larger than the phone viewport; the camera follows the hunter.
+    private var cameraX = 0f
+    private var cameraY = 0f
+    private var viewport = RectF()
     private val restart = RectF()
     private val walls = mutableListOf<RectF>()
     private var arenaNeedsLayout = true
@@ -100,6 +104,8 @@ class MeatballGameView(context: Context) : View(context) {
         hunterVx = 0f
         hunterVy = 0f
         arenaNeedsLayout = true
+        cameraX = 0f
+        cameraY = 0f
         inkTrails.clear()
         activeTrail = null
         orbitTargetId = null
@@ -119,9 +125,12 @@ class MeatballGameView(context: Context) : View(context) {
         val margin = dp(18f)
         val nextLeft = margin
         val nextTop = dp(92f)
-        val nextRight = width - margin
-        val nextBottom = height - dp(72f)
+        // Expand the world to 1.55x the screen in both directions. The camera
+        // shows a screen-sized window into this larger arena.
+        val nextRight = width * 1.55f - margin
+        val nextBottom = height * 1.55f - dp(72f)
         if (nextRight - nextLeft <= dp(100f) || nextBottom - nextTop <= dp(150f)) return
+        viewport.set(margin, nextTop, width - margin, height - dp(72f))
 
         val changed = arenaNeedsLayout ||
             abs(arena.left - nextLeft) > dp(1f) ||
@@ -173,6 +182,8 @@ class MeatballGameView(context: Context) : View(context) {
             val hp = findFreePoint(arena.centerX(), arena.top + h * .14f, hunterRadius)
             hunterX = hp.first
             hunterY = hp.second
+            cameraX = (hunterX - width / 2f).coerceAtLeast(0f)
+            cameraY = (hunterY - (viewport.top + viewport.bottom) / 2f).coerceAtLeast(0f)
         } else {
             survivors.forEach { s ->
                 val p = collideWithArena(s.x, s.y, radiusFor(s))
@@ -256,8 +267,11 @@ class MeatballGameView(context: Context) : View(context) {
         smallPaint.textAlign = Paint.Align.LEFT
         canvas.drawText("SURVIVORS  ${survivors.size}/6", dp(20f), dp(81f), smallPaint)
 
-        canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
+        updateCamera()
         canvas.save()
+        canvas.clipRect(viewport)
+        canvas.translate(-cameraX, -cameraY)
+        canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
         canvas.clipRect(arena)
         var gx = arena.left + dp(20f)
         while (gx < arena.right) {
@@ -394,6 +408,19 @@ class MeatballGameView(context: Context) : View(context) {
         }
     }
 
+
+    private fun updateCamera() {
+        if (width <= 0 || height <= 0 || arena.isEmpty) return
+        val viewCenterY = (viewport.top + viewport.bottom) / 2f
+        val desiredX = hunterX - width / 2f
+        val desiredY = hunterY - viewCenterY
+        val minX = arena.left - viewport.left
+        val maxX = (arena.right - viewport.right).coerceAtLeast(minX)
+        val minY = arena.top - viewport.top
+        val maxY = (arena.bottom - viewport.bottom).coerceAtLeast(minY)
+        cameraX = desiredX.coerceIn(minX, maxX)
+        cameraY = desiredY.coerceIn(minY, maxY)
+    }
 
     // Test the hunter's centre line against walls expanded by its radius.
     // Fine sampling includes both endpoints to avoid routes that cut wall corners.
@@ -809,16 +836,18 @@ class MeatballGameView(context: Context) : View(context) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x
-        val y = event.y
+        val screenX = event.x
+        val screenY = event.y
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                if (restart.contains(x, y)) {
+                if (restart.contains(screenX, screenY)) {
                     reset()
                     setupArena()
                     invalidate()
                     return true
                 }
+                val x = screenX + cameraX
+                val y = screenY + cameraY
                 if (!running && !finished && arena.contains(x, y)) {
                     running = true
                     startTime = System.currentTimeMillis()
@@ -846,6 +875,8 @@ class MeatballGameView(context: Context) : View(context) {
                 if (dragging) {
                     val s = survivors.firstOrNull { it.id == selectedId }
                     if (s != null) {
+                        val x = screenX + cameraX
+                        val y = screenY + cameraY
                         val point = collideWithArena(x, y, radiusFor(s))
                         s.x = point.first
                         s.y = point.second
