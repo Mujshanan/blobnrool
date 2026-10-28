@@ -577,7 +577,7 @@ class MeatballGameView(context: Context) : View(context) {
             orbitAngle = kotlin.math.atan2(hunterY - orbitCenterY, hunterX - orbitCenterX)
         }
         val safeRadius = hunterRadius + radiusFor(target) + dp(52f)
-        orbitAngle += dt * 0.82f
+        orbitAngle += dt * 0.55f
         val orbitX = orbitCenterX + kotlin.math.cos(orbitAngle) * safeRadius
         val orbitY = orbitCenterY + kotlin.math.sin(orbitAngle) * safeRadius
         val dx = orbitX - hunterX
@@ -687,16 +687,22 @@ class MeatballGameView(context: Context) : View(context) {
 
     private fun touchesExistingTrail(trail: InkTrail): Boolean {
         val point = trail.points.lastOrNull() ?: return false
-        val other = inkTrails.firstOrNull { it !== trail && it.points.size >= 2 && !it.closed &&
-            it.points.zipWithNext().any { (a, b) ->
-                distanceToSegment(point.first, point.second, a.first, a.second, b.first, b.second) < dp(14f)
-            }
+        val other = inkTrails.firstOrNull { candidate ->
+            candidate !== trail && candidate.points.size >= 3 &&
+                candidate.points.zipWithNext().any { (a, b) ->
+                    distanceToSegment(point.first, point.second, a.first, a.second, b.first, b.second) < dp(14f)
+                }
         }
         if (other != null) {
-            // Join the two liquid strokes; the combined contour closes a capture region.
-            other.points += trail.points.asReversed()
+            // Join the new stroke to the closest existing ink contour. Treat the
+            // combined outline as one liquid region, rather than two isolated rings.
+            val joinIndex = other.points.indices.minByOrNull { index ->
+                distanceBetween(point.first, point.second, other.points[index].first, other.points[index].second)
+            } ?: return false
+            val joined = other.points.take(joinIndex + 1) + trail.points.asReversed() +
+                other.points.drop(joinIndex + 1)
             trail.points.clear()
-            trail.points += other.points
+            trail.points.addAll(joined)
             inkTrails.remove(other)
             return true
         }
