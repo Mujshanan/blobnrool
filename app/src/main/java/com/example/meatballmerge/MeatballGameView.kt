@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
@@ -13,19 +14,30 @@ import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
 
+private data class InkTrail(
+    val points: MutableList<Pair<Float, Float>>,
+    var closed: Boolean = false,
+    // A trail can close visually for fading without being a valid capture region.
+    var captures: Boolean = false,
+    var age: Float = 0f
+)
+
 private data class Survivor(
     val id: Int,
     var x: Float,
     var y: Float,
     var vx: Float = 0f,
     var vy: Float = 0f,
-    var panic: Float = 0f
+    var panic: Float = 0f,
+    var mass: Float = 1f,
+    var mergePulse: Float = 0f
 )
 
 class MeatballGameView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private fun dp(value: Float) = value * density
     private val survivorRadius get() = dp(17f)
+    private fun radiusFor(survivor: Survivor) = survivorRadius * sqrt(survivor.mass)
     private val hunterRadius get() = dp(29f)
     private val survivors = mutableListOf<Survivor>()
     private val random = Random(System.nanoTime())
@@ -43,8 +55,25 @@ class MeatballGameView(context: Context) : View(context) {
     private var hunterVx = 0f
     private var hunterVy = 0f
     private var arena = RectF()
+    // The playable world is larger than the phone viewport; the camera follows the hunter.
+    private var cameraX = 0f
+    private var cameraY = 0f
+    private var viewport = RectF()
+    private val miniMap = RectF()
     private val restart = RectF()
     private val walls = mutableListOf<RectF>()
+    private var arenaNeedsLayout = true
+    private val inkTrails = mutableListOf<InkTrail>()
+    private var activeTrail: InkTrail? = null
+    private var orbitTargetId: Int? = null
+    private var orbitCenterX = 0f
+    private var orbitCenterY = 0f
+    private var orbitAngle = 0f
+    private var level = 1
+    private var levelJustCleared = false
+
+    private fun survivorTarget() = (5 + level).coerceAtMost(14)
+    private fun obstacleTarget() = (3 + level / 2).coerceAtMost(9)
 
     private val background = Color.rgb(250, 249, 246)
     private val ink = Color.rgb(20, 20, 22)
@@ -68,7 +97,9 @@ class MeatballGameView(context: Context) : View(context) {
         reset()
     }
 
-    private fun reset() {
+    private fun reset(resetProgress: Boolean = true) {
+        if (resetProgress) level = 1
+        levelJustCleared = false
         survivors.clear()
         nextId = 0
         selectedId = null
@@ -80,6 +111,12 @@ class MeatballGameView(context: Context) : View(context) {
         lastFrame = 0L
         hunterVx = 0f
         hunterVy = 0f
+        arenaNeedsLayout = true
+        cameraX = 0f
+        cameraY = 0f
+        inkTrails.clear()
+        activeTrail = null
+        orbitTargetId = null
         // Initial positions are replaced with arena-relative positions on the first layout.
         invalidate()
     }
@@ -94,51 +131,103 @@ class MeatballGameView(context: Context) : View(context) {
 
     private fun setupArena() {
         val margin = dp(18f)
-        val hudBottom = dp(92f)
-        arena.set(margin, hudBottom, width - margin, height - dp(72f))
+        val nextLeft = margin
+        val nextTop = dp(92f)
+        // Expand the world to 1.55x the screen in both directions. The camera
+        // shows a screen-sized window into this larger arena.
+        val nextRight = width * 1.55f - margin
+        val nextBottom = height * 1.55f - dp(72f)
+        if (nextRight - nextLeft <= dp(100f) || nextBottom - nextTop <= dp(150f)) return
+        viewport.set(margin, nextTop, width - margin, height - dp(72f))
+
+        val changed = arenaNeedsLayout ||
+            abs(arena.left - nextLeft) > dp(1f) ||
+            abs(arena.top - nextTop) > dp(1f) ||
+            abs(arena.right - nextRight) > dp(1f) ||
+            abs(arena.bottom - nextBottom) > dp(1f)
+        if (!changed) return
+
+        arena.set(nextLeft, nextTop, nextRight, nextBottom)
         walls.clear()
         val w = arena.width()
         val h = arena.height()
-        if (w <= dp(100f) || h <= dp(150f)) return
-        // Rounded solid obstacles create corners, cover, and alternative routes.
-        walls += RectF(arena.left + w * .28f, arena.top + h * .19f,
-            arena.left + w * .37f, arena.top + h * .48f)
-        walls += RectF(arena.left + w * .62f, arena.top + h * .50f,
-            arena.left + w * .72f, arena.top + h * .79f)
-        walls += RectF(arena.left + w * .43f, arena.top + h * .68f,
-            arena.left + w * .57f, arena.top + h * .74f)
+
+        // Build a fresh, varied layout only on first layout, resize, or restart.
+        // Keep obstacles separated so the hunter always has room to route around them.
+        val desiredCount = obstacleTarget() + random.nextInt(2)
+        var attempts = 0
+        while (walls.size < desiredCount && attempts < 100) {
+            attempts++
+            val obstacleW = w * (.055f + random.nextFloat() * .055f)
+            val obstacleH = h * (.055f + random.nextFloat() * .075f)
+            // Keep a wide, continuous travel lane around every edge. This prevents
+            // obstacles at the far ends from trapping the hunter against the boundary.
+            val edgeLaneX = w * .13f
+            val edgeLaneY = h * .13f
+            val left = arena.left + edgeLaneX + random.nextFloat() * (w - obstacleW - edgeLaneX * 2f)
+            val top = arena.top + edgeLaneY + random.nextFloat() * (h - obstacleH - edgeLaneY * 2f)
+            val candidate = RectF(left, top, left + obstacleW, top + obstacleH)
+            val expanded = RectF(candidate.left - hunterRadius - dp(12f),
+                candidate.top - hunterRadius - dp(12f),
+                candidate.right + hunterRadius + dp(12f),
+                candidate.bottom + hunterRadius + dp(12f))
+            val overlaps = walls.any { existing ->
+                val e = RectF(existing.left - hunterRadius, existing.top - hunterRadius,
+                    existing.right + hunterRadius, existing.bottom + hunterRadius)
+                RectF.intersects(expanded, e)
+            }
+            // Leave the central area open enough that routes can connect around obstacles.
+            val centerKeepout = RectF(arena.centerX() - w * .08f, arena.centerY() - h * .08f,
+                arena.centerX() + w * .08f, arena.centerY() + h * .08f)
+            if (!overlaps && !RectF.intersects(candidate, centerKeepout)) walls += candidate
+        }
+
         if (survivors.isEmpty() && !running && !finished) {
-            val positions = listOf(
-                .13f to .22f, .76f to .18f, .85f to .40f,
-                .16f to .58f, .47f to .35f, .82f to .86f
-            )
-            positions.forEach { (px, py) ->
-                val point = findFreePoint(arena.left + w * px, arena.top + h * py, survivorRadius)
+            repeat(survivorTarget()) {
+                val point = findFreePoint(
+                    arena.left + dp(28f) + random.nextFloat() * (w - dp(56f)),
+                    arena.top + dp(28f) + random.nextFloat() * (h - dp(56f)),
+                    survivorRadius
+                )
                 survivors += Survivor(nextId++, point.first, point.second)
             }
-            val hp = findFreePoint(arena.left + w * .50f, arena.top + h * .16f, hunterRadius)
+            val hp = findFreePoint(arena.centerX(), arena.top + h * .14f, hunterRadius)
+            hunterX = hp.first
+            hunterY = hp.second
+            cameraX = (hunterX - width / 2f).coerceAtLeast(0f)
+            cameraY = (hunterY - (viewport.top + viewport.bottom) / 2f).coerceAtLeast(0f)
+        } else {
+            survivors.forEach { s ->
+                val p = collideWithArena(s.x, s.y, radiusFor(s))
+                s.x = p.first
+                s.y = p.second
+            }
+            val hp = collideWithArena(hunterX, hunterY, hunterRadius)
             hunterX = hp.first
             hunterY = hp.second
         }
+        arenaNeedsLayout = false
     }
 
     private fun findFreePoint(x: Float, y: Float, radius: Float): Pair<Float, Float> {
-        var px = x.coerceIn(arena.left + radius, arena.right - radius)
-        var py = y.coerceIn(arena.top + radius, arena.bottom - radius)
-        repeat(8) {
-            val obstacle = walls.firstOrNull { rect ->
+        fun isFree(px: Float, py: Float): Boolean {
+            if (px < arena.left + radius || px > arena.right - radius ||
+                py < arena.top + radius || py > arena.bottom - radius) return false
+            return walls.none { rect ->
                 val cx = px.coerceIn(rect.left, rect.right)
                 val cy = py.coerceIn(rect.top, rect.bottom)
                 val dx = px - cx
                 val dy = py - cy
-                dx * dx + dy * dy < radius * radius
-            }
-            if (obstacle != null) {
-                px = (obstacle.right + radius + dp(8f)).coerceAtMost(arena.right - radius)
-                py = (obstacle.bottom + radius + dp(8f)).coerceAtMost(arena.bottom - radius)
+                dx * dx + dy * dy < (radius + dp(3f)) * (radius + dp(3f))
             }
         }
-        return px to py
+        if (isFree(x, y)) return x to y
+        repeat(100) {
+            val px = arena.left + radius + random.nextFloat() * (arena.width() - radius * 2f)
+            val py = arena.top + radius + random.nextFloat() * (arena.height() - radius * 2f)
+            if (isFree(px, py)) return px to py
+        }
+        return arena.centerX() to arena.centerY()
     }
 
     private fun collideWithArena(x: Float, y: Float, radius: Float): Pair<Float, Float> {
@@ -183,15 +272,18 @@ class MeatballGameView(context: Context) : View(context) {
         textPaint.textAlign = Paint.Align.RIGHT
         canvas.drawText(formatTime(elapsed()), width - dp(20f), dp(35f), textPaint)
         smallPaint.textAlign = Paint.Align.RIGHT
-        canvas.drawText("SURVIVAL", width - dp(20f), dp(52f), smallPaint)
+        canvas.drawText("LEVEL $level", width - dp(20f), dp(52f), smallPaint)
         textPaint.textAlign = Paint.Align.LEFT
         smallPaint.textAlign = Paint.Align.LEFT
         canvas.drawText("SAVE THE WHITE BLOBS", dp(20f), dp(63f), smallPaint)
         smallPaint.textAlign = Paint.Align.LEFT
-        canvas.drawText("SURVIVORS  ${survivors.size}/6", dp(20f), dp(81f), smallPaint)
+        canvas.drawText("SURVIVORS  ${survivors.size}/${survivorTarget()}", dp(20f), dp(81f), smallPaint)
 
-        canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
+        updateCamera()
         canvas.save()
+        canvas.clipRect(viewport)
+        canvas.translate(-cameraX, -cameraY)
+        canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
         canvas.clipRect(arena)
         var gx = arena.left + dp(20f)
         while (gx < arena.right) {
@@ -206,6 +298,22 @@ class MeatballGameView(context: Context) : View(context) {
 
         walls.forEach { r ->
             canvas.drawRoundRect(r, dp(7f), dp(7f), wallPaint)
+        }
+        // Ink trails are soft, liquid-looking capture boundaries. Completed loops fade away.
+        inkTrails.forEach { trail ->
+            if (trail.points.size >= 2) {
+                val path = Path()
+                trail.points.forEachIndexed { index, point ->
+                    if (index == 0) path.moveTo(point.first, point.second)
+                    else path.lineTo(point.first, point.second)
+                }
+                if (trail.closed && trail.captures) path.close()
+                val alpha = if (trail.closed) (210f * (1f - trail.age / 9f).coerceIn(0f, 1f)).toInt() else 225
+                val fill = Paint(3).apply { color = Color.argb((alpha * .16f).toInt(), 15, 15, 18); style = Paint.Style.FILL }
+                val stroke = Paint(3).apply { color = Color.argb(alpha, 18, 18, 22); style = Paint.Style.STROKE; strokeWidth = dp(7f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+                if (trail.closed && trail.captures) canvas.drawPath(path, fill)
+                canvas.drawPath(path, stroke)
+            }
         }
         // Proximity halo warns the player when the hunter is close to a survivor.
         val closestDistance = survivors.minOfOrNull { s ->
@@ -237,9 +345,32 @@ class MeatballGameView(context: Context) : View(context) {
             hunterX + hunterRadius * .22f, hunterY + hunterRadius * .38f), 15f, 150f, false, angry)
 
         survivors.forEach { survivor ->
-            val r = survivorRadius * (if (survivor.id == selectedId) 1.08f else 1f)
-            canvas.drawCircle(survivor.x, survivor.y, r, survivorPaint)
-            canvas.drawCircle(survivor.x, survivor.y, r, outlinePaint)
+            val r = radiusFor(survivor) * (if (survivor.id == selectedId) 1.08f else 1f)
+            // A wobbling closed contour makes each blob feel soft instead of like a rigid circle.
+            val now = System.currentTimeMillis()
+            val points = 28
+            val contour = Path()
+            for (i in 0 until points) {
+                val angle = (i.toFloat() / points) * (Math.PI * 2.0).toFloat()
+                val wobble = 1f +
+                    .055f * kotlin.math.sin(angle * 3f + now / 170.0 + survivor.id).toFloat() +
+                    .035f * kotlin.math.sin(angle * 5f - now / 230.0 + survivor.mass).toFloat()
+                val px = survivor.x + kotlin.math.cos(angle.toDouble()).toFloat() * r * wobble
+                val py = survivor.y + kotlin.math.sin(angle.toDouble()).toFloat() * r * wobble
+                if (i == 0) contour.moveTo(px, py) else contour.lineTo(px, py)
+            }
+            contour.close()
+            canvas.drawPath(contour, survivorPaint)
+            canvas.drawPath(contour, outlinePaint)
+            if (survivor.mergePulse > 0f) {
+                val pulsePaint = Paint(3).apply {
+                    color = Color.rgb(105, 185, 225)
+                    style = Paint.Style.STROKE
+                    strokeWidth = dp(2f)
+                    alpha = (survivor.mergePulse * 180f).toInt().coerceIn(0, 180)
+                }
+                canvas.drawCircle(survivor.x, survivor.y, r + dp(5f + 18f * (1f - survivor.mergePulse)), pulsePaint)
+            }
             if (survivor.panic > 0.15f) {
                 val panicPaint = Paint(3).apply {
                     color = Color.rgb(220, 70, 70)
@@ -249,14 +380,46 @@ class MeatballGameView(context: Context) : View(context) {
                 }
                 canvas.drawCircle(survivor.x, survivor.y, r + dp(4f + 5f * survivor.panic), panicPaint)
             }
-            val eyeY = survivor.y - r * .14f
-            canvas.drawCircle(survivor.x - r * .27f, eyeY, r * .075f, inkPaint)
-            canvas.drawCircle(survivor.x + r * .27f, eyeY, r * .075f, inkPaint)
             val face = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(1.5f); strokeCap = Paint.Cap.ROUND }
-            if (survivor.panic > .5f) {
-                canvas.drawCircle(survivor.x, survivor.y + r * .28f, r * .10f, face)
+            val faceTime = System.currentTimeMillis()
+            val blink = (faceTime % 3200L) in 0L..110L
+            val eyeY = survivor.y - r * .14f
+            val eyeR = r * .075f
+            if (blink) {
+                canvas.drawLine(survivor.x - r * .34f, eyeY, survivor.x - r * .20f, eyeY, face)
+                canvas.drawLine(survivor.x + r * .20f, eyeY, survivor.x + r * .34f, eyeY, face)
+            } else if (survivor.panic > .72f) {
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR * 1.65f, face)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR * 1.65f, face)
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR * .45f, inkPaint)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR * .45f, inkPaint)
             } else {
-                canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR, inkPaint)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR, inkPaint)
+            }
+            // Expressions change with the action: calm smile, worried frown, or frightened O-mouth.
+            when {
+                survivor.panic > .72f -> {
+                    canvas.drawCircle(survivor.x, survivor.y + r * .28f, r * .12f, face)
+                    canvas.drawLine(survivor.x - r * .40f, eyeY - r * .16f,
+                        survivor.x - r * .18f, eyeY - r * .23f, face)
+                    canvas.drawLine(survivor.x + r * .18f, eyeY - r * .23f,
+                        survivor.x + r * .40f, eyeY - r * .16f, face)
+                }
+                survivor.panic > .35f -> {
+                    canvas.drawArc(RectF(survivor.x - r * .20f, survivor.y + r * .18f,
+                        survivor.x + r * .20f, survivor.y + r * .48f), 200f, 140f, false, face)
+                    canvas.drawLine(survivor.x - r * .38f, eyeY - r * .18f,
+                        survivor.x - r * .16f, eyeY - r * .08f, face)
+                    canvas.drawLine(survivor.x + r * .16f, eyeY - r * .08f,
+                        survivor.x + r * .38f, eyeY - r * .18f, face)
+                }
+                survivor.mergePulse > .35f -> {
+                    canvas.drawArc(RectF(survivor.x - r * .24f, survivor.y + r * .01f,
+                        survivor.x + r * .24f, survivor.y + r * .34f), 15f, 150f, false, face)
+                    canvas.drawCircle(survivor.x, survivor.y - r * .42f, r * .07f, inkPaint)
+                }
+                else -> canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
                     survivor.x + r * .22f, survivor.y + r * .36f), 15f, 150f, false, face)
             }
             if (survivor.id == selectedId) {
@@ -265,11 +428,13 @@ class MeatballGameView(context: Context) : View(context) {
             }
         }
         canvas.restore()
+        drawMiniMap(canvas)
 
         val footerY = height - dp(43f)
         val status = when {
+            finished && levelJustCleared -> "LEVEL $level CLEAR! Tap NEXT LEVEL"
             finished -> "CAUGHT! Tap RESTART to try again"
-            running -> "Drag a white blob away from the ink"
+            running -> "ESCAPE THE INK LOOP — cross the line to break it"
             else -> "Touch a white blob to begin"
         }
         smallPaint.textAlign = Paint.Align.CENTER
@@ -277,7 +442,7 @@ class MeatballGameView(context: Context) : View(context) {
         smallPaint.textAlign = Paint.Align.LEFT
         restart.set(width - dp(110f), height - dp(32f), width - dp(18f), height - dp(8f))
         canvas.drawRoundRect(restart, dp(12f), dp(12f), buttonPaint)
-        canvas.drawText("RESTART", restart.centerX(), restart.centerY() + dp(4f), buttonText)
+        canvas.drawText(if (finished && levelJustCleared) "NEXT LEVEL" else "RESTART", restart.centerX(), restart.centerY() + dp(4f), buttonText)
 
         if (running && !finished) {
             val now = System.currentTimeMillis()
@@ -290,14 +455,57 @@ class MeatballGameView(context: Context) : View(context) {
     }
 
 
-    // Sample a segment against walls expanded by the hunter's radius. Sampling
-    // at short intervals prevents the hunter from choosing a route through a wall.
+    private fun drawMiniMap(canvas: Canvas) {
+        if (arena.isEmpty || width <= 0 || height <= 0) return
+        val mapW = dp(104f)
+        val mapH = dp(72f)
+        miniMap.set(width - dp(16f) - mapW, dp(68f), width - dp(16f), dp(68f) + mapH)
+        val bg = Paint(3).apply { color = Color.argb(225, 24, 27, 35); style = Paint.Style.FILL }
+        val border = Paint(3).apply { color = Color.rgb(110, 118, 130); style = Paint.Style.STROKE; strokeWidth = dp(1f) }
+        canvas.drawRoundRect(miniMap, dp(7f), dp(7f), bg)
+        canvas.save()
+        canvas.clipRect(miniMap.left + dp(3f), miniMap.top + dp(3f), miniMap.right - dp(3f), miniMap.bottom - dp(3f))
+        val inner = RectF(miniMap.left + dp(4f), miniMap.top + dp(4f), miniMap.right - dp(4f), miniMap.bottom - dp(4f))
+        val sx = inner.width() / arena.width()
+        val sy = inner.height() / arena.height()
+        fun mx(x: Float) = inner.left + (x - arena.left) * sx
+        fun my(y: Float) = inner.top + (y - arena.top) * sy
+        val mapArenaPaint = Paint(3).apply { color = Color.rgb(238, 238, 232); style = Paint.Style.FILL }
+        canvas.drawRect(inner, mapArenaPaint)
+        val mapWallPaint = Paint(3).apply { color = Color.rgb(105, 111, 123); style = Paint.Style.FILL }
+        walls.forEach { wall -> canvas.drawRect(mx(wall.left), my(wall.top), mx(wall.right), my(wall.bottom), mapWallPaint) }
+        val survivorDot = Paint(3).apply { color = Color.rgb(105, 190, 220); style = Paint.Style.FILL }
+        survivors.forEach { canvas.drawCircle(mx(it.x), my(it.y), dp(1.7f), survivorDot) }
+        val hunterDot = Paint(3).apply { color = Color.BLACK; style = Paint.Style.FILL }
+        canvas.drawCircle(mx(hunterX), my(hunterY), dp(2.5f), hunterDot)
+        val viewPaint = Paint(3).apply { color = Color.rgb(70, 145, 95); style = Paint.Style.STROKE; strokeWidth = dp(1f) }
+        val visibleWorld = RectF(cameraX + viewport.left, cameraY + viewport.top, cameraX + viewport.right, cameraY + viewport.bottom)
+        canvas.drawRect(mx(visibleWorld.left), my(visibleWorld.top), mx(visibleWorld.right), my(visibleWorld.bottom), viewPaint)
+        canvas.restore()
+        canvas.drawRoundRect(miniMap, dp(7f), dp(7f), border)
+    }
+
+    private fun updateCamera() {
+        if (width <= 0 || height <= 0 || arena.isEmpty) return
+        val viewCenterY = (viewport.top + viewport.bottom) / 2f
+        val desiredX = hunterX - width / 2f
+        val desiredY = hunterY - viewCenterY
+        val minX = arena.left - viewport.left
+        val maxX = (arena.right - viewport.right).coerceAtLeast(minX)
+        val minY = arena.top - viewport.top
+        val maxY = (arena.bottom - viewport.bottom).coerceAtLeast(minY)
+        cameraX = desiredX.coerceIn(minX, maxX)
+        cameraY = desiredY.coerceIn(minY, maxY)
+    }
+
+    // Test the hunter's centre line against walls expanded by its radius.
+    // Fine sampling includes both endpoints to avoid routes that cut wall corners.
     private fun pathBlocked(x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
         val dx = x2 - x1
         val dy = y2 - y1
         val distance = sqrt(dx * dx + dy * dy)
-        val steps = max(1, (distance / dp(7f)).toInt())
-        for (i in 1 until steps) {
+        val steps = max(2, kotlin.math.ceil(distance / dp(4f)).toInt())
+        for (i in 0..steps) {
             val t = i.toFloat() / steps
             val px = x1 + dx * t
             val py = y1 + dy * t
@@ -309,16 +517,46 @@ class MeatballGameView(context: Context) : View(context) {
         return false
     }
 
-    private fun hunterSteeringTarget(targetX: Float, targetY: Float): Pair<Float, Float> {
-        if (!pathBlocked(hunterX, hunterY, targetX, targetY)) return targetX to targetY
+    private fun routeGoal(targetX: Float, targetY: Float): Pair<Float, Float> {
+        var gx = targetX
+        var gy = targetY
+        // A survivor can stand closer to a wall than the hunter can. Project the
+        // destination out of the hunter's clearance zone so the route has a valid end.
+        repeat(walls.size + 1) {
+            walls.forEach { wall ->
+                val left = wall.left - hunterRadius - dp(3f)
+                val right = wall.right + hunterRadius + dp(3f)
+                val top = wall.top - hunterRadius - dp(3f)
+                val bottom = wall.bottom + hunterRadius + dp(3f)
+                if (gx >= left && gx <= right && gy >= top && gy <= bottom) {
+                    val options = listOf(
+                        (abs(gx - left)) to (left to gy),
+                        (abs(right - gx)) to (right to gy),
+                        (abs(gy - top)) to (gx to top),
+                        (abs(bottom - gy)) to (gx to bottom)
+                    )
+                    val best = options.minByOrNull { it.first }!!.second
+                    gx = best.first
+                    gy = best.second
+                }
+            }
+        }
+        gx = gx.coerceIn(arena.left + hunterRadius, arena.right - hunterRadius)
+        gy = gy.coerceIn(arena.top + hunterRadius, arena.bottom - hunterRadius)
+        return gx to gy
+    }
 
-        val padding = hunterRadius + dp(10f)
-        val candidates = walls.flatMap { wall ->
+    private fun hunterSteeringTarget(targetX: Float, targetY: Float): Pair<Float, Float> {
+        val goal = routeGoal(targetX, targetY)
+        if (!pathBlocked(hunterX, hunterY, goal.first, goal.second)) return goal
+
+        val clearance = hunterRadius + dp(8f)
+        val corners = walls.flatMap { wall ->
             listOf(
-                (wall.left - padding) to (wall.top - padding),
-                (wall.right + padding) to (wall.top - padding),
-                (wall.left - padding) to (wall.bottom + padding),
-                (wall.right + padding) to (wall.bottom + padding)
+                (wall.left - clearance) to (wall.top - clearance),
+                (wall.right + clearance) to (wall.top - clearance),
+                (wall.left - clearance) to (wall.bottom + clearance),
+                (wall.right + clearance) to (wall.bottom + clearance)
             )
         }.filter { (x, y) ->
             x >= arena.left + hunterRadius && x <= arena.right - hunterRadius &&
@@ -326,23 +564,105 @@ class MeatballGameView(context: Context) : View(context) {
                 walls.none { wall ->
                     x >= wall.left - hunterRadius && x <= wall.right + hunterRadius &&
                         y >= wall.top - hunterRadius && y <= wall.bottom + hunterRadius
-                } &&
-                !pathBlocked(hunterX, hunterY, x, y) &&
-                !pathBlocked(x, y, targetX, targetY)
+                }
         }
 
-        val waypoint = candidates.minByOrNull { (x, y) ->
-            val a = sqrt((x - hunterX) * (x - hunterX) + (y - hunterY) * (y - hunterY))
-            val b = sqrt((targetX - x) * (targetX - x) + (targetY - y) * (targetY - y))
-            a + b
+        // Visibility graph + Dijkstra: choose the first waypoint on the shortest
+        // collision-free route, not just a corner that happens to look promising.
+        val nodes = mutableListOf(hunterX to hunterY, goal)
+        corners.forEach { corner ->
+            if (nodes.none { abs(it.first - corner.first) < dp(1f) && abs(it.second - corner.second) < dp(1f) }) {
+                nodes += corner
+            }
         }
-        return waypoint ?: (targetX to targetY)
+        val count = nodes.size
+        val distances = FloatArray(count) { Float.POSITIVE_INFINITY }
+        val previous = IntArray(count) { -1 }
+        val visited = BooleanArray(count)
+        distances[0] = 0f
+        repeat(count) {
+            var current = -1
+            var best = Float.POSITIVE_INFINITY
+            for (i in 0 until count) {
+                if (!visited[i] && distances[i] < best) {
+                    best = distances[i]
+                    current = i
+                }
+            }
+            if (current < 0) return@repeat
+            if (current == 1) return@repeat
+            visited[current] = true
+            for (next in 1 until count) {
+                if (next == current || visited[next]) continue
+                val a = nodes[current]
+                val b = nodes[next]
+                if (pathBlocked(a.first, a.second, b.first, b.second)) continue
+                val dx = b.first - a.first
+                val dy = b.second - a.second
+                val candidate = distances[current] + sqrt(dx * dx + dy * dy)
+                if (candidate < distances[next]) {
+                    distances[next] = candidate
+                    previous[next] = current
+                }
+            }
+        }
+        if (!distances[1].isFinite()) {
+            // The random generator keeps routes open; if a rare corner case remains,
+            // move toward the closest reachable corner rather than pushing into a wall.
+            return corners.filterNot { pathBlocked(hunterX, hunterY, it.first, it.second) }
+                .minByOrNull { (x, y) ->
+                    val tx = goal.first - x
+                    val ty = goal.second - y
+                    tx * tx + ty * ty
+                } ?: (hunterX to hunterY)
+        }
+        var step = 1
+        while (previous[step] > 0) step = previous[step]
+        return nodes[step]
+    }
+
+    private fun mergeNearbySurvivors() {
+        var changed = true
+        while (changed) {
+            changed = false
+            outer@ for (i in survivors.indices) {
+                for (j in i + 1 until survivors.size) {
+                    val a = survivors[i]
+                    val b = survivors[j]
+                    val dx = b.x - a.x
+                    val dy = b.y - a.y
+                    val combinedRadius = radiusFor(a) + radiusFor(b)
+                    if (dx * dx + dy * dy < combinedRadius * combinedRadius * .72f) {
+                        val keep = if (selectedId == b.id) b else a
+                        val lose = if (keep === a) b else a
+                        val total = a.mass + b.mass
+                        keep.x = (a.x * a.mass + b.x * b.mass) / total
+                        keep.y = (a.y * a.mass + b.y * b.mass) / total
+                        keep.vx = (a.vx * a.mass + b.vx * b.mass) / total
+                        keep.vy = (a.vy * a.mass + b.vy * b.mass) / total
+                        keep.mass = total
+                        keep.mergePulse = 1f
+                        if (selectedId == lose.id) selectedId = keep.id
+                        survivors.remove(lose)
+                        val safe = collideWithArena(keep.x, keep.y, radiusFor(keep))
+                        keep.x = safe.first
+                        keep.y = safe.second
+                        changed = true
+                        break@outer
+                    }
+                }
+            }
+        }
     }
 
     private fun updateGame(dt: Float, now: Long) {
+        mergeNearbySurvivors()
+        inkTrails.forEach { if (it.closed) it.age += dt }
+        inkTrails.removeAll { it.closed && it.age >= 9f }
         if (survivors.isEmpty()) {
             running = false
             finished = true
+            levelJustCleared = true
             finalTime = now
             return
         }
@@ -351,16 +671,65 @@ class MeatballGameView(context: Context) : View(context) {
             val dy = it.y - hunterY
             dx * dx + dy * dy
         } ?: return
-        val steering = hunterSteeringTarget(target.x, target.y)
-        val dx = steering.first - hunterX
-        val dy = steering.second - hunterY
+
+        // The hunter maintains a no-contact buffer and circles a fixed target position,
+        // painting an ink boundary as it goes. White blobs can escape before closure.
+        if (activeTrail == null || orbitTargetId != target.id) {
+            activeTrail?.let { previousTrail ->
+                // An abandoned, incomplete stroke fades as a line; never render it
+                // as a filled polygon or treat it as a capture.
+                previousTrail.closed = true
+                previousTrail.captures = false
+                previousTrail.age = 0f
+            }
+            orbitTargetId = target.id
+            orbitCenterX = target.x
+            orbitCenterY = target.y
+            orbitAngle = kotlin.math.atan2(hunterY - orbitCenterY, hunterX - orbitCenterX)
+            val initialSafeRadius = hunterRadius + radiusFor(target) + dp(30f)
+            val startX = orbitCenterX + kotlin.math.cos(orbitAngle) * initialSafeRadius
+            val startY = orbitCenterY + kotlin.math.sin(orbitAngle) * initialSafeRadius
+            activeTrail = InkTrail(mutableListOf(startX to startY))
+            inkTrails += activeTrail!!
+        }
+        val safeRadius = hunterRadius + radiusFor(target) + dp(30f)
+        // A slightly faster, tighter orbit makes capture loops close reliably on mobile.
+        orbitAngle += dt * (0.8f + (level - 1) * 0.06f)
+        val orbitX = orbitCenterX + kotlin.math.cos(orbitAngle) * safeRadius
+        val orbitY = orbitCenterY + kotlin.math.sin(orbitAngle) * safeRadius
+        val dx = orbitX - hunterX
+        val dy = orbitY - hunterY
         val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
-        val hunterSpeed = dp(54f)
+        val hunterSpeed = dp(70f)
         hunterVx = dx / distance * hunterSpeed
         hunterVy = dy / distance * hunterSpeed
         val nextHunter = collideWithArena(hunterX + hunterVx * dt, hunterY + hunterVy * dt, hunterRadius)
         hunterX = nextHunter.first
         hunterY = nextHunter.second
+
+        val trail = activeTrail
+        if (trail != null) {
+            val last = trail.points.lastOrNull()
+            if (last == null || distanceBetween(last.first, last.second, hunterX, hunterY) >= dp(5f)) {
+                trail.points += hunterX to hunterY
+            }
+            val start = trail.points.first()
+            val travelled = trail.points.zipWithNext().sumOf { (a, b) ->
+                distanceBetween(a.first, a.second, b.first, b.second).toDouble()
+            }.toFloat()
+            val closedByStart = trail.points.size > 24 &&
+                travelled > safeRadius * 3.8f &&
+                distanceBetween(hunterX, hunterY, start.first, start.second) < dp(30f)
+            val connected = trail.points.size > 12 && touchesExistingTrail(trail)
+            if (closedByStart || connected) {
+                trail.closed = true
+                trail.age = 0f
+                trail.captures = isValidCapturePolygon(trail.points, dp(18f) * dp(18f))
+                if (trail.captures) captureInside(trail, now)
+                activeTrail = null
+                orbitTargetId = null
+            }
+        }
 
         survivors.toList().forEach { s ->
             val tx = s.x - hunterX
@@ -371,41 +740,204 @@ class MeatballGameView(context: Context) : View(context) {
                 val flee = if (dist < dp(135f)) 1f else 0f
                 val wanderX = kotlin.math.sin((now / 700.0) + s.id).toFloat() * dp(12f)
                 val wanderY = kotlin.math.cos((now / 900.0) + s.id * 2).toFloat() * dp(12f)
-                val desiredX = -tx / dist * dp(46f) * flee + wanderX
-                val desiredY = -ty / dist * dp(46f) * flee + wanderY
-                s.vx += (desiredX - s.vx) * min(1f, dt * 3f)
+                // Nearby blobs attract each other like liquid droplets, making
+                // merging a deliberate, visible part of the survival loop.
+                var mergeX = 0f
+                var mergeY = 0f
+                var mergeStrength = 0f
+                survivors.forEach { other ->
+                    if (other.id != s.id) {
+                        val ox = other.x - s.x
+                        val oy = other.y - s.y
+                        val od = sqrt(ox * ox + oy * oy).coerceAtLeast(1f)
+                        val reach = (radiusFor(s) + radiusFor(other)) * 2.5f
+                        if (od < reach) {
+                            val strength = (1f - od / reach).coerceIn(0f, 1f)
+                            mergeX += ox / od * strength
+                            mergeY += oy / od * strength
+                            mergeStrength = max(mergeStrength, strength)
+                        }
+                    }
+                }
+                val desiredX = -tx / dist * dp(46f) * flee + wanderX +
+                    mergeX * dp(32f) * (1f - flee * .35f)
+                val desiredY = -ty / dist * dp(46f) * flee + wanderY +
+                    mergeY * dp(32f) * (1f - flee * .35f)
+                s.vx += (desiredX - s.vx) * min(1f, dt * (3f + mergeStrength * 2f))
                 s.vy += (desiredY - s.vy) * min(1f, dt * 3f)
-                val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, survivorRadius)
+                val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, radiusFor(s))
                 s.x = next.first
                 s.y = next.second
             }
-            val cx = s.x - hunterX
-            val cy = s.y - hunterY
-            if (cx * cx + cy * cy < (hunterRadius + survivorRadius * .62f).let { it * it }) {
-                survivors.remove(s)
-                if (selectedId == s.id) {
-                    selectedId = null
-                    dragging = false
+            s.mergePulse = (s.mergePulse - dt * 1.6f).coerceAtLeast(0f)
+        }
+        // Crossing a still-forming boundary breaks the entire drawing, giving the
+        // player a readable counterplay instead of instant hunter contact kills.
+        val drawing = activeTrail
+        if (drawing != null && drawing.points.size >= 2) {
+            val cut = survivors.any { s ->
+                drawing.points.zipWithNext().any { (a, b) ->
+                    distanceToSegment(s.x, s.y, a.first, a.second, b.first, b.second) <= radiusFor(s) + dp(4f)
                 }
+            }
+            if (cut) {
+                inkTrails.remove(drawing)
+                activeTrail = null
+                orbitTargetId = null
             }
         }
     }
 
+    private fun distanceBetween(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x2 - x1
+        val dy = y2 - y1
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    private fun distanceToSegment(px: Float, py: Float, ax: Float, ay: Float, bx: Float, by: Float): Float {
+        val dx = bx - ax
+        val dy = by - ay
+        val lengthSquared = dx * dx + dy * dy
+        if (lengthSquared <= .001f) return distanceBetween(px, py, ax, ay)
+        val t = (((px - ax) * dx + (py - ay) * dy) / lengthSquared).coerceIn(0f, 1f)
+        return distanceBetween(px, py, ax + t * dx, ay + t * dy)
+    }
+
+    private fun touchesExistingTrail(trail: InkTrail): Boolean {
+        val point = trail.points.lastOrNull() ?: return false
+        val other = inkTrails.firstOrNull { candidate ->
+            candidate !== trail && candidate.points.size >= 3 &&
+                candidate.points.zipWithNext().any { (a, b) ->
+                    distanceToSegment(point.first, point.second, a.first, a.second, b.first, b.second) < dp(14f)
+                }
+        }
+        if (other != null) {
+            // Join the new stroke to the closest existing ink contour. Treat the
+            // combined outline as one liquid region, rather than two isolated rings.
+            val joinIndex = other.points.indices.minByOrNull { index ->
+                distanceBetween(point.first, point.second, other.points[index].first, other.points[index].second)
+            } ?: return false
+            val joined = other.points.take(joinIndex + 1) + trail.points.asReversed() +
+                other.points.drop(joinIndex + 1)
+            trail.points.clear()
+            trail.points.addAll(joined)
+            inkTrails.remove(other)
+            return true
+        }
+        return false
+    }
+
+    private fun isValidCapturePolygon(points: List<Pair<Float, Float>>, minArea: Float): Boolean {
+        if (points.size < 4) return false
+        if (polygonArea(points) < minArea) return false
+
+        // Test every edge, including the implicit edge from the final point back
+        // to the first. Adjacent edges share a vertex by design and are skipped.
+        val edgeCount = points.size
+        for (i in 0 until edgeCount) {
+            val a = points[i]
+            val b = points[(i + 1) % edgeCount]
+            for (j in i + 1 until edgeCount) {
+                if (j == i + 1 || (i == 0 && j == edgeCount - 1)) continue
+                val c = points[j]
+                val d = points[(j + 1) % edgeCount]
+                if (segmentsIntersect(a.first, a.second, b.first, b.second,
+                        c.first, c.second, d.first, d.second)) return false
+            }
+        }
+        return true
+    }
+
+    private fun polygonArea(points: List<Pair<Float, Float>>): Float {
+        var twiceArea = 0f
+        for (i in points.indices) {
+            val next = points[(i + 1) % points.size]
+            val current = points[i]
+            twiceArea += current.first * next.second - next.first * current.second
+        }
+        return abs(twiceArea) * .5f
+    }
+
+    private fun segmentsIntersect(
+        ax: Float, ay: Float, bx: Float, by: Float,
+        cx: Float, cy: Float, dx: Float, dy: Float
+    ): Boolean {
+        fun orientation(px: Float, py: Float, qx: Float, qy: Float, rx: Float, ry: Float): Float =
+            (qx - px) * (ry - py) - (qy - py) * (rx - px)
+        fun onSegment(px: Float, py: Float, qx: Float, qy: Float, rx: Float, ry: Float): Boolean =
+            rx >= min(px, qx) - .01f && rx <= max(px, qx) + .01f &&
+                ry >= min(py, qy) - .01f && ry <= max(py, qy) + .01f
+
+        val o1 = orientation(ax, ay, bx, by, cx, cy)
+        val o2 = orientation(ax, ay, bx, by, dx, dy)
+        val o3 = orientation(cx, cy, dx, dy, ax, ay)
+        val o4 = orientation(cx, cy, dx, dy, bx, by)
+        if ((o1 > 0f && o2 < 0f || o1 < 0f && o2 > 0f) &&
+            (o3 > 0f && o4 < 0f || o3 < 0f && o4 > 0f)) return true
+        if (abs(o1) < .01f && onSegment(ax, ay, bx, by, cx, cy)) return true
+        if (abs(o2) < .01f && onSegment(ax, ay, bx, by, dx, dy)) return true
+        if (abs(o3) < .01f && onSegment(cx, cy, dx, dy, ax, ay)) return true
+        if (abs(o4) < .01f && onSegment(cx, cy, dx, dy, bx, by)) return true
+        return false
+    }
+
+    private fun captureInside(trail: InkTrail, now: Long) {
+        if (trail.points.size < 4 || !trail.captures) return
+        // Match Papersseum's enclosure rule: mark the ink as a wall, flood-fill
+        // from the arena's outside, and capture only blobs in unreachable cells.
+        val captured = floodFilledSurvivors(trail.points)
+        captured.forEach { survivor ->
+            survivors.remove(survivor)
+            if (selectedId == survivor.id) {
+                selectedId = null
+                dragging = false
+            }
+        }
+        if (survivors.isEmpty()) {
+            running = false
+            finished = true
+            levelJustCleared = true
+            finalTime = now
+        }
+    }
+
+    private fun floodFilledSurvivors(points: List<Pair<Float, Float>>): List<Survivor> {
+        val boundary = points.map { CaptureFloodFill.Point(it.first, it.second) }
+        val candidates = survivors.map { CaptureFloodFill.Point(it.x, it.y) }
+        val bounds = CaptureFloodFill.Bounds(arena.left, arena.top, arena.right, arena.bottom)
+        val capturedIndices = CaptureFloodFill.enclosedCandidateIndices(
+            boundary = boundary,
+            candidates = candidates,
+            bounds = bounds,
+            cellSize = dp(6f).coerceAtLeast(1f)
+        )
+        return capturedIndices.mapNotNull(survivors::getOrNull)
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x
-        val y = event.y
+        val screenX = event.x
+        val screenY = event.y
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                if (restart.contains(x, y)) {
-                    reset()
+                if (restart.contains(screenX, screenY)) {
+                    if (finished && levelJustCleared) {
+                        level = (level + 1).coerceAtMost(10)
+                        reset(resetProgress = false)
+                    } else {
+                        reset()
+                    }
                     setupArena()
                     invalidate()
                     return true
                 }
+                val x = screenX + cameraX
+                val y = screenY + cameraY
                 if (!running && !finished && arena.contains(x, y)) {
                     running = true
                     startTime = System.currentTimeMillis()
                     lastFrame = startTime
+                    activeTrail = null
+                    orbitTargetId = null
                 }
                 val target = survivors.minByOrNull {
                     val dx = it.x - x
@@ -415,7 +947,7 @@ class MeatballGameView(context: Context) : View(context) {
                 if (target != null) {
                     val dx = target.x - x
                     val dy = target.y - y
-                    if (dx * dx + dy * dy < dp(42f) * dp(42f)) {
+                    if (dx * dx + dy * dy < (radiusFor(target) + dp(25f)).let { it * it }) {
                         selectedId = target.id
                         dragging = true
                     }
@@ -427,7 +959,9 @@ class MeatballGameView(context: Context) : View(context) {
                 if (dragging) {
                     val s = survivors.firstOrNull { it.id == selectedId }
                     if (s != null) {
-                        val point = collideWithArena(x, y, survivorRadius)
+                        val x = screenX + cameraX
+                        val y = screenY + cameraY
+                        val point = collideWithArena(x, y, radiusFor(s))
                         s.x = point.first
                         s.y = point.second
                         s.vx = 0f
