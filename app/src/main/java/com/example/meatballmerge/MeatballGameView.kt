@@ -573,12 +573,15 @@ class MeatballGameView(context: Context) : View(context) {
                 previousTrail.closed = true
                 previousTrail.age = 0f
             }
-            activeTrail = InkTrail(mutableListOf(hunterX to hunterY))
-            inkTrails += activeTrail!!
             orbitTargetId = target.id
             orbitCenterX = target.x
             orbitCenterY = target.y
             orbitAngle = kotlin.math.atan2(hunterY - orbitCenterY, hunterX - orbitCenterX)
+            val initialSafeRadius = hunterRadius + radiusFor(target) + dp(52f)
+            val startX = orbitCenterX + kotlin.math.cos(orbitAngle) * initialSafeRadius
+            val startY = orbitCenterY + kotlin.math.sin(orbitAngle) * initialSafeRadius
+            activeTrail = InkTrail(mutableListOf(startX to startY))
+            inkTrails += activeTrail!!
         }
         val safeRadius = hunterRadius + radiusFor(target) + dp(52f)
         orbitAngle += dt * 0.55f
