@@ -504,7 +504,7 @@ class MeatballGameView(context: Context) : View(context) {
                         keep.y = (a.y * a.mass + b.y * b.mass) / total
                         keep.vx = (a.vx * a.mass + b.vx * b.mass) / total
                         keep.vy = (a.vy * a.mass + b.vy * b.mass) / total
-                        keep.mass = (total).coerceAtMost(5f)
+                        keep.mass = total
                         keep.mergePulse = 1f
                         if (selectedId == lose.id) selectedId = keep.id
                         survivors.remove(lose)
@@ -552,9 +552,30 @@ class MeatballGameView(context: Context) : View(context) {
                 val flee = if (dist < dp(135f)) 1f else 0f
                 val wanderX = kotlin.math.sin((now / 700.0) + s.id).toFloat() * dp(12f)
                 val wanderY = kotlin.math.cos((now / 900.0) + s.id * 2).toFloat() * dp(12f)
-                val desiredX = -tx / dist * dp(46f) * flee + wanderX
-                val desiredY = -ty / dist * dp(46f) * flee + wanderY
-                s.vx += (desiredX - s.vx) * min(1f, dt * 3f)
+                // Nearby blobs attract each other like liquid droplets, making
+                // merging a deliberate, visible part of the survival loop.
+                var mergeX = 0f
+                var mergeY = 0f
+                var mergeStrength = 0f
+                survivors.forEach { other ->
+                    if (other.id != s.id) {
+                        val ox = other.x - s.x
+                        val oy = other.y - s.y
+                        val od = sqrt(ox * ox + oy * oy).coerceAtLeast(1f)
+                        val reach = (radiusFor(s) + radiusFor(other)) * 2.5f
+                        if (od < reach) {
+                            val strength = (1f - od / reach).coerceIn(0f, 1f)
+                            mergeX += ox / od * strength
+                            mergeY += oy / od * strength
+                            mergeStrength = max(mergeStrength, strength)
+                        }
+                    }
+                }
+                val desiredX = -tx / dist * dp(46f) * flee + wanderX +
+                    mergeX * dp(32f) * (1f - flee * .35f)
+                val desiredY = -ty / dist * dp(46f) * flee + wanderY +
+                    mergeY * dp(32f) * (1f - flee * .35f)
+                s.vx += (desiredX - s.vx) * min(1f, dt * (3f + mergeStrength * 2f))
                 s.vy += (desiredY - s.vy) * min(1f, dt * 3f)
                 val next = collideWithArena(s.x + s.vx * dt, s.y + s.vy * dt, radiusFor(s))
                 s.x = next.first
