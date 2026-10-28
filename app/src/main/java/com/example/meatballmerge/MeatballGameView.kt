@@ -69,6 +69,11 @@ class MeatballGameView(context: Context) : View(context) {
     private var orbitCenterX = 0f
     private var orbitCenterY = 0f
     private var orbitAngle = 0f
+    private var level = 1
+    private var levelJustCleared = false
+
+    private fun survivorTarget() = (5 + level).coerceAtMost(14)
+    private fun obstacleTarget() = (3 + level / 2).coerceAtMost(9)
 
     private val background = Color.rgb(250, 249, 246)
     private val ink = Color.rgb(20, 20, 22)
@@ -92,7 +97,9 @@ class MeatballGameView(context: Context) : View(context) {
         reset()
     }
 
-    private fun reset() {
+    private fun reset(resetProgress: Boolean = true) {
+        if (resetProgress) level = 1
+        levelJustCleared = false
         survivors.clear()
         nextId = 0
         selectedId = null
@@ -147,7 +154,7 @@ class MeatballGameView(context: Context) : View(context) {
 
         // Build a fresh, varied layout only on first layout, resize, or restart.
         // Keep obstacles separated so the hunter always has room to route around them.
-        val desiredCount = 4 + random.nextInt(3)
+        val desiredCount = obstacleTarget() + random.nextInt(2)
         var attempts = 0
         while (walls.size < desiredCount && attempts < 100) {
             attempts++
@@ -176,7 +183,7 @@ class MeatballGameView(context: Context) : View(context) {
         }
 
         if (survivors.isEmpty() && !running && !finished) {
-            repeat(6) {
+            repeat(survivorTarget()) {
                 val point = findFreePoint(
                     arena.left + dp(28f) + random.nextFloat() * (w - dp(56f)),
                     arena.top + dp(28f) + random.nextFloat() * (h - dp(56f)),
@@ -265,12 +272,12 @@ class MeatballGameView(context: Context) : View(context) {
         textPaint.textAlign = Paint.Align.RIGHT
         canvas.drawText(formatTime(elapsed()), width - dp(20f), dp(35f), textPaint)
         smallPaint.textAlign = Paint.Align.RIGHT
-        canvas.drawText("SURVIVAL", width - dp(20f), dp(52f), smallPaint)
+        canvas.drawText("LEVEL $level", width - dp(20f), dp(52f), smallPaint)
         textPaint.textAlign = Paint.Align.LEFT
         smallPaint.textAlign = Paint.Align.LEFT
         canvas.drawText("SAVE THE WHITE BLOBS", dp(20f), dp(63f), smallPaint)
         smallPaint.textAlign = Paint.Align.LEFT
-        canvas.drawText("SURVIVORS  ${survivors.size}/6", dp(20f), dp(81f), smallPaint)
+        canvas.drawText("SURVIVORS  ${survivors.size}/${survivorTarget()}", dp(20f), dp(81f), smallPaint)
 
         updateCamera()
         canvas.save()
@@ -373,14 +380,46 @@ class MeatballGameView(context: Context) : View(context) {
                 }
                 canvas.drawCircle(survivor.x, survivor.y, r + dp(4f + 5f * survivor.panic), panicPaint)
             }
-            val eyeY = survivor.y - r * .14f
-            canvas.drawCircle(survivor.x - r * .27f, eyeY, r * .075f, inkPaint)
-            canvas.drawCircle(survivor.x + r * .27f, eyeY, r * .075f, inkPaint)
             val face = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(1.5f); strokeCap = Paint.Cap.ROUND }
-            if (survivor.panic > .5f) {
-                canvas.drawCircle(survivor.x, survivor.y + r * .28f, r * .10f, face)
+            val faceTime = System.currentTimeMillis()
+            val blink = (faceTime % 3200L) in 0L..110L
+            val eyeY = survivor.y - r * .14f
+            val eyeR = r * .075f
+            if (blink) {
+                canvas.drawLine(survivor.x - r * .34f, eyeY, survivor.x - r * .20f, eyeY, face)
+                canvas.drawLine(survivor.x + r * .20f, eyeY, survivor.x + r * .34f, eyeY, face)
+            } else if (survivor.panic > .72f) {
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR * 1.65f, face)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR * 1.65f, face)
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR * .45f, inkPaint)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR * .45f, inkPaint)
             } else {
-                canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
+                canvas.drawCircle(survivor.x - r * .27f, eyeY, eyeR, inkPaint)
+                canvas.drawCircle(survivor.x + r * .27f, eyeY, eyeR, inkPaint)
+            }
+            // Expressions change with the action: calm smile, worried frown, or frightened O-mouth.
+            when {
+                survivor.panic > .72f -> {
+                    canvas.drawCircle(survivor.x, survivor.y + r * .28f, r * .12f, face)
+                    canvas.drawLine(survivor.x - r * .40f, eyeY - r * .16f,
+                        survivor.x - r * .18f, eyeY - r * .23f, face)
+                    canvas.drawLine(survivor.x + r * .18f, eyeY - r * .23f,
+                        survivor.x + r * .40f, eyeY - r * .16f, face)
+                }
+                survivor.panic > .35f -> {
+                    canvas.drawArc(RectF(survivor.x - r * .20f, survivor.y + r * .18f,
+                        survivor.x + r * .20f, survivor.y + r * .48f), 200f, 140f, false, face)
+                    canvas.drawLine(survivor.x - r * .38f, eyeY - r * .18f,
+                        survivor.x - r * .16f, eyeY - r * .08f, face)
+                    canvas.drawLine(survivor.x + r * .16f, eyeY - r * .08f,
+                        survivor.x + r * .38f, eyeY - r * .18f, face)
+                }
+                survivor.mergePulse > .35f -> {
+                    canvas.drawArc(RectF(survivor.x - r * .24f, survivor.y + r * .01f,
+                        survivor.x + r * .24f, survivor.y + r * .34f), 15f, 150f, false, face)
+                    canvas.drawCircle(survivor.x, survivor.y - r * .42f, r * .07f, inkPaint)
+                }
+                else -> canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
                     survivor.x + r * .22f, survivor.y + r * .36f), 15f, 150f, false, face)
             }
             if (survivor.id == selectedId) {
@@ -393,6 +432,7 @@ class MeatballGameView(context: Context) : View(context) {
 
         val footerY = height - dp(43f)
         val status = when {
+            finished && levelJustCleared -> "LEVEL $level CLEAR! Tap NEXT LEVEL"
             finished -> "CAUGHT! Tap RESTART to try again"
             running -> "ESCAPE THE INK LOOP — cross the line to break it"
             else -> "Touch a white blob to begin"
@@ -402,7 +442,7 @@ class MeatballGameView(context: Context) : View(context) {
         smallPaint.textAlign = Paint.Align.LEFT
         restart.set(width - dp(110f), height - dp(32f), width - dp(18f), height - dp(8f))
         canvas.drawRoundRect(restart, dp(12f), dp(12f), buttonPaint)
-        canvas.drawText("RESTART", restart.centerX(), restart.centerY() + dp(4f), buttonText)
+        canvas.drawText(if (finished && levelJustCleared) "NEXT LEVEL" else "RESTART", restart.centerX(), restart.centerY() + dp(4f), buttonText)
 
         if (running && !finished) {
             val now = System.currentTimeMillis()
@@ -622,6 +662,7 @@ class MeatballGameView(context: Context) : View(context) {
         if (survivors.isEmpty()) {
             running = false
             finished = true
+            levelJustCleared = true
             finalTime = now
             return
         }
@@ -855,6 +896,7 @@ class MeatballGameView(context: Context) : View(context) {
         if (survivors.isEmpty()) {
             running = false
             finished = true
+            levelJustCleared = true
             finalTime = now
         }
     }
@@ -878,7 +920,12 @@ class MeatballGameView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (restart.contains(screenX, screenY)) {
-                    reset()
+                    if (finished && levelJustCleared) {
+                        level = (level + 1).coerceAtMost(10)
+                        reset(resetProgress = false)
+                    } else {
+                        reset()
+                    }
                     setupArena()
                     invalidate()
                     return true
