@@ -187,6 +187,8 @@ class MeatballGameView(context: Context) : View(context) {
         textPaint.textAlign = Paint.Align.LEFT
         smallPaint.textAlign = Paint.Align.LEFT
         canvas.drawText("SAVE THE WHITE BLOBS", dp(20f), dp(63f), smallPaint)
+        smallPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText("SURVIVORS  ${survivors.size}/6", dp(20f), dp(81f), smallPaint)
 
         canvas.drawRoundRect(arena, dp(18f), dp(18f), Paint(3).apply { color = Color.WHITE; style = Paint.Style.FILL })
         canvas.save()
@@ -204,6 +206,21 @@ class MeatballGameView(context: Context) : View(context) {
 
         walls.forEach { r ->
             canvas.drawRoundRect(r, dp(7f), dp(7f), wallPaint)
+        }
+        // Proximity halo warns the player when the hunter is close to a survivor.
+        val closestDistance = survivors.minOfOrNull { s ->
+            val dx = s.x - hunterX
+            val dy = s.y - hunterY
+            sqrt(dx * dx + dy * dy)
+        } ?: Float.MAX_VALUE
+        if (closestDistance < dp(165f)) {
+            val warningPaint = Paint(3).apply {
+                color = Color.rgb(220, 70, 70)
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2f)
+                alpha = (90 + 100 * (1f - closestDistance / dp(165f))).toInt().coerceIn(90, 190)
+            }
+            canvas.drawCircle(hunterX, hunterY, hunterRadius + dp(8f), warningPaint)
         }
         // Draw the ink hunter as an irregular-looking black mass with white eyes.
         canvas.drawCircle(hunterX, hunterY, hunterRadius, inkPaint)
@@ -223,6 +240,15 @@ class MeatballGameView(context: Context) : View(context) {
             val r = survivorRadius * (if (survivor.id == selectedId) 1.08f else 1f)
             canvas.drawCircle(survivor.x, survivor.y, r, survivorPaint)
             canvas.drawCircle(survivor.x, survivor.y, r, outlinePaint)
+            if (survivor.panic > 0.15f) {
+                val panicPaint = Paint(3).apply {
+                    color = Color.rgb(220, 70, 70)
+                    style = Paint.Style.STROKE
+                    strokeWidth = dp(1.5f)
+                    alpha = (70 + survivor.panic * 150f).toInt().coerceIn(70, 220)
+                }
+                canvas.drawCircle(survivor.x, survivor.y, r + dp(4f + 5f * survivor.panic), panicPaint)
+            }
             val eyeY = survivor.y - r * .14f
             canvas.drawCircle(survivor.x - r * .27f, eyeY, r * .075f, inkPaint)
             canvas.drawCircle(survivor.x + r * .27f, eyeY, r * .075f, inkPaint)
