@@ -796,77 +796,16 @@ class MeatballGameView(context: Context) : View(context) {
     }
 
     private fun floodFilledSurvivors(points: List<Pair<Float, Float>>): List<Survivor> {
-        val cellSize = dp(6f).coerceAtLeast(1f)
-        val cols = kotlin.math.ceil(arena.width() / cellSize).toInt().coerceAtLeast(1)
-        val rows = kotlin.math.ceil(arena.height() / cellSize).toInt().coerceAtLeast(1)
-        val blocked = BooleanArray(cols * rows)
-        val reachable = BooleanArray(cols * rows)
-
-        fun cellX(x: Float) = ((x - arena.left) / cellSize).toInt().coerceIn(0, cols - 1)
-        fun cellY(y: Float) = ((y - arena.top) / cellSize).toInt().coerceIn(0, rows - 1)
-        fun markWall(x: Float, y: Float) {
-            val cx = cellX(x)
-            val cy = cellY(y)
-            // Thicken the rasterized line one cell so diagonal strokes cannot
-            // leave pinholes in the 4-neighbour flood fill.
-            for (dy in -1..1) for (dx in -1..1) {
-                val nx = cx + dx
-                val ny = cy + dy
-                if (nx in 0 until cols && ny in 0 until rows) blocked[ny * cols + nx] = true
-            }
-        }
-
-        // Sample every edge, including the implicit closing edge, densely enough
-        // that fast finger movement still creates a continuous digital boundary.
-        for (i in points.indices) {
-            val a = points[i]
-            val b = points[(i + 1) % points.size]
-            val dx = b.first - a.first
-            val dy = b.second - a.second
-            val distance = sqrt(dx * dx + dy * dy)
-            val steps = kotlin.math.ceil(distance / (cellSize * .45f)).toInt().coerceAtLeast(1)
-            for (step in 0..steps) {
-                val t = step.toFloat() / steps
-                markWall(a.first + dx * t, a.second + dy * t)
-            }
-        }
-
-        val queue = IntArray(cols * rows)
-        var head = 0
-        var tail = 0
-        fun visit(x: Int, y: Int) {
-            if (x !in 0 until cols || y !in 0 until rows) return
-            val id = y * cols + x
-            if (!blocked[id] && !reachable[id]) {
-                reachable[id] = true
-                queue[tail++] = id
-            }
-        }
-        for (x in 0 until cols) {
-            visit(x, 0)
-            visit(x, rows - 1)
-        }
-        for (y in 0 until rows) {
-            visit(0, y)
-            visit(cols - 1, y)
-        }
-        while (head < tail) {
-            val id = queue[head++]
-            val x = id % cols
-            val y = id / cols
-            visit(x - 1, y)
-            visit(x + 1, y)
-            visit(x, y - 1)
-            visit(x, y + 1)
-        }
-
-        return survivors.filter { survivor ->
-            if (!arena.contains(survivor.x, survivor.y)) return@filter false
-            val x = cellX(survivor.x)
-            val y = cellY(survivor.y)
-            val id = y * cols + x
-            !blocked[id] && !reachable[id]
-        }
+        val boundary = points.map { CaptureFloodFill.Point(it.first, it.second) }
+        val candidates = survivors.map { CaptureFloodFill.Point(it.x, it.y) }
+        val bounds = CaptureFloodFill.Bounds(arena.left, arena.top, arena.right, arena.bottom)
+        val capturedIndices = CaptureFloodFill.enclosedCandidateIndices(
+            boundary = boundary,
+            candidates = candidates,
+            bounds = bounds,
+            cellSize = dp(6f).coerceAtLeast(1f)
+        )
+        return capturedIndices.mapNotNull(survivors::getOrNull)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
