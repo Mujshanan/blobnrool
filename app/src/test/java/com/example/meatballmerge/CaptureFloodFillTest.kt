@@ -40,4 +40,31 @@ class CaptureFloodFillTest {
 
         assertEquals(setOf(0), CaptureFloodFill.enclosedCandidateIndices(boundary, candidates, bounds, 2f))
     }
+
+    @Test
+    fun loopNearArenaEdgeStillCapturesInterior() {
+        val boundary = listOf(point(4f, 20f), point(35f, 20f), point(35f, 55f), point(4f, 55f))
+        val candidates = listOf(point(18f, 35f), point(45f, 35f), point(2f, 35f))
+
+        assertEquals(setOf(0), CaptureFloodFill.enclosedCandidateIndices(boundary, candidates, bounds, 2f))
+    }
+
+    @Test
+    fun concaveLoopCapturesOnlyEnclosedCandidate() {
+        val boundary = listOf(
+            point(20f, 20f), point(80f, 20f), point(80f, 40f),
+            point(45f, 40f), point(45f, 80f), point(20f, 80f)
+        )
+        val candidates = listOf(point(30f, 60f), point(65f, 60f), point(50f, 30f))
+
+        assertEquals(setOf(0, 2), CaptureFloodFill.enclosedCandidateIndices(boundary, candidates, bounds, 2f))
+    }
+
+    @Test
+    fun invalidCoordinatesFailSafely() {
+        val boundary = listOf(point(20f, 20f), point(Float.NaN, 50f), point(80f, 80f))
+        val candidates = listOf(point(50f, 50f))
+
+        assertTrue(CaptureFloodFill.enclosedCandidateIndices(boundary, candidates, bounds, 2f).isEmpty())
+    }
 }
