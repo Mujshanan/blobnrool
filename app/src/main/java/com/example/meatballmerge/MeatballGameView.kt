@@ -263,6 +263,56 @@ class MeatballGameView(context: Context) : View(context) {
         }
     }
 
+
+    // Sample a segment against walls expanded by the hunter's radius. Sampling
+    // at short intervals prevents the hunter from choosing a route through a wall.
+    private fun pathBlocked(x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
+        val dx = x2 - x1
+        val dy = y2 - y1
+        val distance = sqrt(dx * dx + dy * dy)
+        val steps = max(1, (distance / dp(7f)).toInt())
+        for (i in 1 until steps) {
+            val t = i.toFloat() / steps
+            val px = x1 + dx * t
+            val py = y1 + dy * t
+            if (walls.any { wall ->
+                px >= wall.left - hunterRadius && px <= wall.right + hunterRadius &&
+                    py >= wall.top - hunterRadius && py <= wall.bottom + hunterRadius
+            }) return true
+        }
+        return false
+    }
+
+    private fun hunterSteeringTarget(targetX: Float, targetY: Float): Pair<Float, Float> {
+        if (!pathBlocked(hunterX, hunterY, targetX, targetY)) return targetX to targetY
+
+        val padding = hunterRadius + dp(10f)
+        val candidates = walls.flatMap { wall ->
+            listOf(
+                (wall.left - padding) to (wall.top - padding),
+                (wall.right + padding) to (wall.top - padding),
+                (wall.left - padding) to (wall.bottom + padding),
+                (wall.right + padding) to (wall.bottom + padding)
+            )
+        }.filter { (x, y) ->
+            x >= arena.left + hunterRadius && x <= arena.right - hunterRadius &&
+                y >= arena.top + hunterRadius && y <= arena.bottom - hunterRadius &&
+                walls.none { wall ->
+                    x >= wall.left - hunterRadius && x <= wall.right + hunterRadius &&
+                        y >= wall.top - hunterRadius && y <= wall.bottom + hunterRadius
+                } &&
+                !pathBlocked(hunterX, hunterY, x, y) &&
+                !pathBlocked(x, y, targetX, targetY)
+        }
+
+        val waypoint = candidates.minByOrNull { (x, y) ->
+            val a = sqrt((x - hunterX) * (x - hunterX) + (y - hunterY) * (y - hunterY))
+            val b = sqrt((targetX - x) * (targetX - x) + (targetY - y) * (targetY - y))
+            a + b
+        }
+        return waypoint ?: (targetX to targetY)
+    }
+
     private fun updateGame(dt: Float, now: Long) {
         if (survivors.isEmpty()) {
             running = false
@@ -275,8 +325,9 @@ class MeatballGameView(context: Context) : View(context) {
             val dy = it.y - hunterY
             dx * dx + dy * dy
         } ?: return
-        val dx = target.x - hunterX
-        val dy = target.y - hunterY
+        val steering = hunterSteeringTarget(target.x, target.y)
+        val dx = steering.first - hunterX
+        val dy = steering.second - hunterY
         val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
         val hunterSpeed = dp(54f)
         hunterVx = dx / distance * hunterSpeed
