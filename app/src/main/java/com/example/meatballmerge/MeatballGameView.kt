@@ -569,6 +569,10 @@ class MeatballGameView(context: Context) : View(context) {
         // The hunter maintains a no-contact buffer and circles a fixed target position,
         // painting an ink boundary as it goes. White blobs can escape before closure.
         if (activeTrail == null || orbitTargetId != target.id) {
+            activeTrail?.let { previousTrail ->
+                previousTrail.closed = true
+                previousTrail.age = 0f
+            }
             activeTrail = InkTrail(mutableListOf(hunterX to hunterY))
             inkTrails += activeTrail!!
             orbitTargetId = target.id
