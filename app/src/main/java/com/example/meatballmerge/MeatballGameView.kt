@@ -38,7 +38,14 @@ class MeatballGameView(context: Context) : View(context) {
     private fun dp(value: Float) = value * density
     private val survivorRadius get() = dp(17f)
     private fun radiusFor(survivor: Survivor) = survivorRadius * sqrt(survivor.mass)
-    private val hunterRadius get() = dp(29f)
+    private var hunterMass = 1f
+    private val hunterRadius get() = survivorRadius * sqrt(hunterMass)
+    private val joystickRadius get() = dp(34f)
+    private val joystickCenterX get() = dp(55f)
+    private val joystickCenterY get() = height - dp(100f)
+    private var joystickActive = false
+    private var joystickX = 0f
+    private var joystickY = 0f
     private val survivors = mutableListOf<Survivor>()
     private val random = Random(System.nanoTime())
     private var nextId = 0
@@ -61,6 +68,7 @@ class MeatballGameView(context: Context) : View(context) {
     private var viewport = RectF()
     private val miniMap = RectF()
     private val restart = RectF()
+    private val joystickBounds = RectF()
     private val walls = mutableListOf<RectF>()
     private var arenaNeedsLayout = true
     private val inkTrails = mutableListOf<InkTrail>()
@@ -91,6 +99,9 @@ class MeatballGameView(context: Context) : View(context) {
     private val buttonPaint = Paint(3).apply { color = ink; style = Paint.Style.FILL }
     private val buttonText = Paint(3).apply { color = Color.WHITE; textSize = dp(12f); textAlign = Paint.Align.CENTER; typeface = android.graphics.Typeface.create("sans-serif-medium", 0) }
     private val gridPaint = Paint(3).apply { color = faint; strokeWidth = dp(1f) }
+    private val joystickBasePaint = Paint(3).apply { color = Color.argb(115, 28, 31, 38); style = Paint.Style.FILL }
+    private val joystickRingPaint = Paint(3).apply { color = Color.argb(170, 100, 106, 116); style = Paint.Style.STROKE; strokeWidth = dp(2f) }
+    private val joystickKnobPaint = Paint(3).apply { color = Color.rgb(35, 38, 45); style = Paint.Style.FILL }
 
     init {
         isFocusable = true
@@ -104,6 +115,10 @@ class MeatballGameView(context: Context) : View(context) {
         nextId = 0
         selectedId = null
         dragging = false
+        joystickActive = false
+        joystickX = 0f
+        joystickY = 0f
+        hunterMass = 1f
         running = false
         finished = false
         startTime = 0L
@@ -360,26 +375,9 @@ class MeatballGameView(context: Context) : View(context) {
                 if (i == 0) contour.moveTo(px, py) else contour.lineTo(px, py)
             }
             contour.close()
+            // Keep each white blob clean: a white fill and one black outline only.
             canvas.drawPath(contour, survivorPaint)
             canvas.drawPath(contour, outlinePaint)
-            if (survivor.mergePulse > 0f) {
-                val pulsePaint = Paint(3).apply {
-                    color = Color.rgb(105, 185, 225)
-                    style = Paint.Style.STROKE
-                    strokeWidth = dp(2f)
-                    alpha = (survivor.mergePulse * 180f).toInt().coerceIn(0, 180)
-                }
-                canvas.drawCircle(survivor.x, survivor.y, r + dp(5f + 18f * (1f - survivor.mergePulse)), pulsePaint)
-            }
-            if (survivor.panic > 0.15f) {
-                val panicPaint = Paint(3).apply {
-                    color = Color.rgb(220, 70, 70)
-                    style = Paint.Style.STROKE
-                    strokeWidth = dp(1.5f)
-                    alpha = (70 + survivor.panic * 150f).toInt().coerceIn(70, 220)
-                }
-                canvas.drawCircle(survivor.x, survivor.y, r + dp(4f + 5f * survivor.panic), panicPaint)
-            }
             val face = Paint(3).apply { color = ink; style = Paint.Style.STROKE; strokeWidth = dp(1.5f); strokeCap = Paint.Cap.ROUND }
             val faceTime = System.currentTimeMillis()
             val blink = (faceTime % 3200L) in 0L..110L
@@ -422,20 +420,17 @@ class MeatballGameView(context: Context) : View(context) {
                 else -> canvas.drawArc(RectF(survivor.x - r * .22f, survivor.y + r * .02f,
                     survivor.x + r * .22f, survivor.y + r * .36f), 15f, 150f, false, face)
             }
-            if (survivor.id == selectedId) {
-                val ring = Paint(3).apply { color = Color.rgb(90, 145, 105); style = Paint.Style.STROKE; strokeWidth = dp(2f) }
-                canvas.drawCircle(survivor.x, survivor.y, r + dp(5f), ring)
-            }
         }
         canvas.restore()
         drawMiniMap(canvas)
+        drawJoystick(canvas)
 
         val footerY = height - dp(43f)
         val status = when {
             finished && levelJustCleared -> "LEVEL $level CLEAR! Tap NEXT LEVEL"
             finished -> "CAUGHT! Tap RESTART to try again"
-            running -> "ESCAPE THE INK LOOP — cross the line to break it"
-            else -> "Touch a white blob to begin"
+            running -> "MOVE THE BLACK BLOB — CLOSE A LOOP TO CAPTURE"
+            else -> "Use the joystick to move the black blob"
         }
         smallPaint.textAlign = Paint.Align.CENTER
         canvas.drawText(status, width / 2f, footerY, smallPaint)
@@ -666,69 +661,50 @@ class MeatballGameView(context: Context) : View(context) {
             finalTime = now
             return
         }
-        val target = survivors.minByOrNull {
-            val dx = it.x - hunterX
-            val dy = it.y - hunterY
-            dx * dx + dy * dy
-        } ?: return
+        // The player controls the black blob with the on-screen joystick.
+        // Movement leaves ink behind; returning near the starting point closes a capture loop.
+        val inputLength = sqrt(joystickX * joystickX + joystickY * joystickY)
+        if (inputLength > .08f) {
+            if (activeTrail == null) {
+                activeTrail = InkTrail(mutableListOf(hunterX to hunterY))
+                inkTrails += activeTrail!!
+            }
+            val speed = dp(145f)
+            val next = collideWithArena(
+                hunterX + joystickX * speed * dt,
+                hunterY + joystickY * speed * dt,
+                hunterRadius
+            )
+            hunterX = next.first
+            hunterY = next.second
+            hunterVx = joystickX * speed
+            hunterVy = joystickY * speed
 
-        // The hunter maintains a no-contact buffer and circles a fixed target position,
-        // painting an ink boundary as it goes. White blobs can escape before closure.
-        if (activeTrail == null || orbitTargetId != target.id) {
-            activeTrail?.let { previousTrail ->
-                // An abandoned, incomplete stroke fades as a line; never render it
-                // as a filled polygon or treat it as a capture.
-                previousTrail.closed = true
-                previousTrail.captures = false
-                previousTrail.age = 0f
+            val trail = activeTrail
+            if (trail != null) {
+                val last = trail.points.lastOrNull()
+                if (last == null || distanceBetween(last.first, last.second, hunterX, hunterY) >= dp(4f)) {
+                    trail.points += hunterX to hunterY
+                }
+                val first = trail.points.first()
+                val travelled = trail.points.zipWithNext().sumOf { (a, b) ->
+                    distanceBetween(a.first, a.second, b.first, b.second).toDouble()
+                }.toFloat()
+                val closeToStart = trail.points.size > 18 &&
+                    travelled > hunterRadius * 4.5f &&
+                    distanceBetween(hunterX, hunterY, first.first, first.second) < dp(24f)
+                if (closeToStart) {
+                    trail.closed = true
+                    trail.age = 0f
+                    trail.captures = isValidCapturePolygon(trail.points, dp(18f) * dp(18f))
+                    if (trail.captures) captureInside(trail, now)
+                    activeTrail = null
+                    orbitTargetId = null
+                }
             }
-            orbitTargetId = target.id
-            orbitCenterX = target.x
-            orbitCenterY = target.y
-            orbitAngle = kotlin.math.atan2(hunterY - orbitCenterY, hunterX - orbitCenterX)
-            val initialSafeRadius = hunterRadius + radiusFor(target) + dp(30f)
-            val startX = orbitCenterX + kotlin.math.cos(orbitAngle) * initialSafeRadius
-            val startY = orbitCenterY + kotlin.math.sin(orbitAngle) * initialSafeRadius
-            activeTrail = InkTrail(mutableListOf(startX to startY))
-            inkTrails += activeTrail!!
-        }
-        val safeRadius = hunterRadius + radiusFor(target) + dp(30f)
-        // A slightly faster, tighter orbit makes capture loops close reliably on mobile.
-        orbitAngle += dt * (0.8f + (level - 1) * 0.06f)
-        val orbitX = orbitCenterX + kotlin.math.cos(orbitAngle) * safeRadius
-        val orbitY = orbitCenterY + kotlin.math.sin(orbitAngle) * safeRadius
-        val dx = orbitX - hunterX
-        val dy = orbitY - hunterY
-        val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
-        val hunterSpeed = dp(70f)
-        hunterVx = dx / distance * hunterSpeed
-        hunterVy = dy / distance * hunterSpeed
-        val nextHunter = collideWithArena(hunterX + hunterVx * dt, hunterY + hunterVy * dt, hunterRadius)
-        hunterX = nextHunter.first
-        hunterY = nextHunter.second
-
-        val trail = activeTrail
-        if (trail != null) {
-            val last = trail.points.lastOrNull()
-            if (last == null || distanceBetween(last.first, last.second, hunterX, hunterY) >= dp(5f)) {
-                trail.points += hunterX to hunterY
-            }
-            val start = trail.points.first()
-            val travelled = trail.points.zipWithNext().sumOf { (a, b) ->
-                distanceBetween(a.first, a.second, b.first, b.second).toDouble()
-            }.toFloat()
-            val closedByStart = trail.points.size > 24 &&
-                travelled > safeRadius * 3.8f &&
-                distanceBetween(hunterX, hunterY, start.first, start.second) < dp(30f)
-            val connected = trail.points.size > 12 && touchesExistingTrail(trail)
-            if (closedByStart || connected) {
-                trail.closed = true
-                trail.age = 0f
-                trail.captures = isValidCapturePolygon(trail.points, dp(18f) * dp(18f))
-                if (trail.captures) captureInside(trail, now)
-                activeTrail = null
-                orbitTargetId = null
-            }
+        } else {
+            hunterVx = 0f
+            hunterVy = 0f
         }
 
         survivors.toList().forEach { s ->
@@ -883,9 +859,14 @@ class MeatballGameView(context: Context) : View(context) {
 
     private fun captureInside(trail: InkTrail, now: Long) {
         if (trail.points.size < 4 || !trail.captures) return
-        // Match Papersseum's enclosure rule: mark the ink as a wall, flood-fill
-        // from the arena's outside, and capture only blobs in unreachable cells.
+        // Captured blobs feed the black blob, increasing its radius with each capture.
         val captured = floodFilledSurvivors(trail.points)
+        if (captured.isNotEmpty()) {
+            hunterMass = (hunterMass + captured.size).coerceAtMost(9f)
+            val safeHunter = collideWithArena(hunterX, hunterY, hunterRadius)
+            hunterX = safeHunter.first
+            hunterY = safeHunter.second
+        }
         captured.forEach { survivor ->
             survivors.remove(survivor)
             if (selectedId == survivor.id) {
@@ -914,6 +895,27 @@ class MeatballGameView(context: Context) : View(context) {
         return capturedIndices.mapNotNull(survivors::getOrNull)
     }
 
+    private fun drawJoystick(canvas: Canvas) {
+        val cx = joystickCenterX
+        val cy = joystickCenterY
+        joystickBounds.set(cx - joystickRadius * 1.45f, cy - joystickRadius * 1.45f,
+            cx + joystickRadius * 1.45f, cy + joystickRadius * 1.45f)
+        canvas.drawCircle(cx, cy, joystickRadius * 1.35f, joystickBasePaint)
+        canvas.drawCircle(cx, cy, joystickRadius * 1.35f, joystickRingPaint)
+        val knobTravel = joystickRadius * .72f
+        canvas.drawCircle(cx + joystickX * knobTravel, cy + joystickY * knobTravel,
+            joystickRadius * .52f, joystickKnobPaint)
+    }
+
+    private fun updateJoystick(x: Float, y: Float) {
+        val dx = x - joystickCenterX
+        val dy = y - joystickCenterY
+        val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
+        val scale = min(1f, joystickRadius / distance)
+        joystickX = dx / distance * scale
+        joystickY = dy / distance * scale
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val screenX = event.x
         val screenY = event.y
@@ -930,50 +932,39 @@ class MeatballGameView(context: Context) : View(context) {
                     invalidate()
                     return true
                 }
+                val dx = screenX - joystickCenterX
+                val dy = screenY - joystickCenterY
+                if (dx * dx + dy * dy <= (joystickRadius * 1.65f) * (joystickRadius * 1.65f)) {
+                    joystickActive = true
+                    updateJoystick(screenX, screenY)
+                    if (!running && !finished) {
+                        running = true
+                        startTime = System.currentTimeMillis()
+                        lastFrame = startTime
+                    }
+                    invalidate()
+                    return true
+                }
+                // Tapping the play field also starts the game, but never drags a white blob.
                 val x = screenX + cameraX
                 val y = screenY + cameraY
                 if (!running && !finished && arena.contains(x, y)) {
                     running = true
                     startTime = System.currentTimeMillis()
                     lastFrame = startTime
-                    activeTrail = null
-                    orbitTargetId = null
-                }
-                val target = survivors.minByOrNull {
-                    val dx = it.x - x
-                    val dy = it.y - y
-                    dx * dx + dy * dy
-                }
-                if (target != null) {
-                    val dx = target.x - x
-                    val dy = target.y - y
-                    if (dx * dx + dy * dy < (radiusFor(target) + dp(25f)).let { it * it }) {
-                        selectedId = target.id
-                        dragging = true
-                    }
                 }
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (dragging) {
-                    val s = survivors.firstOrNull { it.id == selectedId }
-                    if (s != null) {
-                        val x = screenX + cameraX
-                        val y = screenY + cameraY
-                        val point = collideWithArena(x, y, radiusFor(s))
-                        s.x = point.first
-                        s.y = point.second
-                        s.vx = 0f
-                        s.vy = 0f
-                    }
-                }
+                if (joystickActive) updateJoystick(screenX, screenY)
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                dragging = false
-                selectedId = null
+                joystickActive = false
+                joystickX = 0f
+                joystickY = 0f
                 invalidate()
                 return true
             }
